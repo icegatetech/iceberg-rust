@@ -81,7 +81,8 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        tracing::debug!(num_schemas = schemas.len(), "Loaded catalog schemas");
+        tracing::Span::current().record("num_schemas", schemas.len());
+        tracing::debug!("Loaded catalog schemas");
 
         Ok(IcebergCatalogProvider { schemas })
     }

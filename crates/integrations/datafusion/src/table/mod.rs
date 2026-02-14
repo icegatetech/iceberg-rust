@@ -331,6 +331,7 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         tracing::debug!(
+            table = %self.table.identifier(),
             snapshot_id = ?self.snapshot_id,
             projection = ?projection.map(|p| p.len()),
             num_filters = filters.len(),

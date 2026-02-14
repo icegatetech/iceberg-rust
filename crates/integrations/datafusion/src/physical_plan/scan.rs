@@ -153,10 +153,10 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        tracing::debug!(partition = _partition, "Executing IcebergTableScan");
+        tracing::debug!(partition, "Executing IcebergTableScan");
 
         let fut = get_batch_stream(
             self.table.clone(),
