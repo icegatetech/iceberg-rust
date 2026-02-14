@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
-
 use tracing::instrument;
 
 use crate::delete_file_index::DeleteFileIndex;
@@ -84,10 +83,7 @@ impl ManifestFileContext {
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
 
-        tracing::debug!(
-            num_entries = manifest.entries().len(),
-            "Loaded manifest"
-        );
+        tracing::debug!(num_entries = manifest.entries().len(), "Loaded manifest");
 
         for manifest_entry in manifest.entries() {
             let manifest_entry_context = ManifestEntryContext {
