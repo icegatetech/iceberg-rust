@@ -30,6 +30,7 @@ use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
+use tracing::instrument;
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
@@ -57,6 +58,7 @@ impl IcebergSchemaProvider {
     /// This method retrieves a list of table names
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
+    #[instrument(skip_all, fields(namespace = %namespace))]
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -84,6 +86,8 @@ impl IcebergSchemaProvider {
         for (name, provider) in table_names.into_iter().zip(providers.into_iter()) {
             tables.insert(name, Arc::new(provider));
         }
+
+        tracing::debug!(num_tables = tables.len(), "Loaded schema tables");
 
         Ok(IcebergSchemaProvider {
             catalog: client,

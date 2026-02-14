@@ -142,6 +142,14 @@ impl ArrowReader {
     /// Take a stream of FileScanTasks and reads all the files.
     /// Returns a stream of Arrow RecordBatches containing the data from the files
     pub fn read(self, tasks: FileScanTaskStream) -> Result<ArrowRecordBatchStream> {
+        tracing::debug!(
+            concurrency_limit_data_files = self.concurrency_limit_data_files,
+            row_group_filtering_enabled = self.row_group_filtering_enabled,
+            row_selection_enabled = self.row_selection_enabled,
+            batch_size = ?self.batch_size,
+            "ArrowReader starting read"
+        );
+
         let file_io = self.file_io.clone();
         let batch_size = self.batch_size;
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
@@ -206,6 +214,14 @@ impl ArrowReader {
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
     ) -> Result<ArrowRecordBatchStream> {
+        tracing::debug!(
+            file_path = %task.data_file_path,
+            record_count = ?task.record_count,
+            has_predicate = task.predicate.is_some(),
+            num_deletes = task.deletes.len(),
+            "Processing file scan task"
+        );
+
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
 
@@ -449,6 +465,13 @@ impl ArrowReader {
         }
 
         if let Some(selected_row_group_indices) = selected_row_group_indices {
+            let total_row_groups = record_batch_stream_builder.metadata().row_groups().len();
+            tracing::debug!(
+                file_path = %task.data_file_path,
+                selected_row_groups = selected_row_group_indices.len(),
+                total_row_groups = total_row_groups,
+                "Row group filtering results"
+            );
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_groups(selected_row_group_indices);
         }

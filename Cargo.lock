@@ -3418,6 +3418,7 @@ dependencies = [
  "strum",
  "tempfile",
  "tokio",
+ "tracing",
  "typed-builder",
  "typetag",
  "url",
@@ -3549,6 +3550,7 @@ dependencies = [
  "parquet",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent, Result};
+use tracing::instrument;
 
 use crate::schema::IcebergSchemaProvider;
 
@@ -46,6 +47,7 @@ impl IcebergCatalogProvider {
     /// This method retrieves the list of namespace names
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
+    #[instrument(skip_all, fields(num_schemas))]
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
         // TODO:
         // Schemas and providers should be cached and evicted based on time
@@ -78,6 +80,8 @@ impl IcebergCatalogProvider {
                 (name, provider)
             })
             .collect();
+
+        tracing::debug!(num_schemas = schemas.len(), "Loaded catalog schemas");
 
         Ok(IcebergCatalogProvider { schemas })
     }

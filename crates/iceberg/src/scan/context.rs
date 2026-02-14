@@ -20,6 +20,8 @@ use std::sync::Arc;
 use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
 
+use tracing::instrument;
+
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
@@ -66,6 +68,7 @@ pub(crate) struct ManifestEntryContext {
 impl ManifestFileContext {
     /// Consumes this [`ManifestFileContext`], fetching its Manifest from FileIO and then
     /// streaming its constituent [`ManifestEntries`] to the channel provided in the context
+    #[instrument(skip(self), fields(manifest_path = %self.manifest_file.manifest_path))]
     pub(crate) async fn fetch_manifest_and_stream_manifest_entries(self) -> Result<()> {
         let ManifestFileContext {
             object_cache,
@@ -80,6 +83,11 @@ impl ManifestFileContext {
         } = self;
 
         let manifest = object_cache.get_manifest(&manifest_file).await?;
+
+        tracing::debug!(
+            num_entries = manifest.entries().len(),
+            "Loaded manifest"
+        );
 
         for manifest_entry in manifest.entries() {
             let manifest_entry_context = ManifestEntryContext {
@@ -108,6 +116,11 @@ impl ManifestEntryContext {
     /// consume this `ManifestEntryContext`, returning a `FileScanTask`
     /// created from it
     pub(crate) async fn into_file_scan_task(self) -> Result<FileScanTask> {
+        tracing::trace!(
+            file_path = %self.manifest_entry.file_path(),
+            record_count = self.manifest_entry.record_count(),
+            "Creating file scan task"
+        );
         let deletes = self
             .delete_file_index
             .get_deletes_for_data_file(
@@ -164,10 +177,17 @@ pub(crate) struct PlanContext {
 
 impl PlanContext {
     pub(crate) async fn get_manifest_list(&self) -> Result<Arc<ManifestList>> {
-        self.object_cache
+        tracing::debug!("Loading manifest list");
+        let manifest_list = self
+            .object_cache
             .as_ref()
             .get_manifest_list(&self.snapshot, &self.table_metadata)
-            .await
+            .await?;
+        tracing::debug!(
+            num_manifests = manifest_list.entries().len(),
+            "Loaded manifest list"
+        );
+        Ok(manifest_list)
     }
 
     fn get_partition_filter(&self, manifest_file: &ManifestFile) -> Result<Arc<BoundPredicate>> {
@@ -198,6 +218,7 @@ impl PlanContext {
         delete_file_idx: DeleteFileIndex,
         delete_file_tx: Sender<ManifestEntryContext>,
     ) -> Result<Box<impl Iterator<Item = Result<ManifestFileContext>> + 'static>> {
+        let total_manifests = manifest_list.entries().len();
         let mut manifest_files = manifest_list.entries().iter().collect::<Vec<_>>();
         // Sort manifest files to process delete manifests first.
         // This avoids a deadlock where the producer blocks on sending data manifest entries
@@ -249,6 +270,12 @@ impl PlanContext {
 
             filtered_mfcs.push(Ok(mfc));
         }
+
+        tracing::debug!(
+            total_manifests = total_manifests,
+            filtered_manifests = filtered_mfcs.len(),
+            "Built manifest file contexts"
+        );
 
         Ok(Box::new(filtered_mfcs.into_iter()))
     }

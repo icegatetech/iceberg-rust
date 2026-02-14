@@ -42,10 +42,16 @@ enum OpTransformedResult {
 /// If none of the filters could be converted, return `None` which adds no predicates to the scan operation.
 /// If the conversion was successful, return the converted predicates combined with an AND operator.
 pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
-    filters
+    let result = filters
         .iter()
         .filter_map(convert_filter_to_predicate)
-        .reduce(Predicate::and)
+        .reduce(Predicate::and);
+    tracing::debug!(
+        num_input_filters = filters.len(),
+        converted = result.is_some(),
+        "Converted DataFusion filters to iceberg predicate"
+    );
+    result
 }
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {

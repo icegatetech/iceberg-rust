@@ -32,6 +32,7 @@ use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
+use tracing::instrument;
 
 use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
@@ -72,6 +73,15 @@ impl IcebergTableScan {
         let plan_properties = Self::compute_properties(output_schema.clone());
         let projection = get_column_names(schema.clone(), projection);
         let predicates = convert_filters_to_predicate(filters);
+
+        tracing::debug!(
+            table = %table.identifier(),
+            snapshot_id = ?snapshot_id,
+            num_projected_columns = ?projection.as_ref().map(|p| p.len()),
+            has_predicates = predicates.is_some(),
+            limit = ?limit,
+            "Created IcebergTableScan"
+        );
 
         Self {
             table,
@@ -146,6 +156,8 @@ impl ExecutionPlan for IcebergTableScan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        tracing::debug!(partition = _partition, "Executing IcebergTableScan");
+
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
@@ -205,12 +217,20 @@ impl DisplayAs for IcebergTableScan {
 ///
 /// This function initializes a [`TableScan`], builds it,
 /// and then converts it into a stream of Arrow [`RecordBatch`]es.
+#[instrument(skip_all, fields(snapshot_id, has_predicates, num_columns))]
 async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    tracing::Span::current()
+        .record("snapshot_id", tracing::field::debug(&snapshot_id))
+        .record("has_predicates", predicates.is_some())
+        .record(
+            "num_columns",
+            column_names.as_ref().map_or(0, |c| c.len()) as i64,
+        );
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),

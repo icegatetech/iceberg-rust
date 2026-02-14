@@ -87,9 +87,17 @@ impl IcebergTableProvider {
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
 
+        tracing::debug!(table = %table_ident, "Loading table");
+
         // Load table once to get initial schema
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+
+        tracing::debug!(
+            table = %table_ident,
+            schema_fields = schema.fields().len(),
+            "Loaded table schema"
+        );
 
         Ok(IcebergTableProvider {
             catalog,
@@ -129,6 +137,14 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        tracing::debug!(
+            table = %self.table_ident,
+            projection = ?projection.map(|p| p.len()),
+            num_filters = filters.len(),
+            limit = ?limit,
+            "Creating table scan"
+        );
+
         // Load fresh table metadata from catalog
         let table = self
             .catalog
@@ -314,6 +330,14 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        tracing::debug!(
+            snapshot_id = ?self.snapshot_id,
+            projection = ?projection.map(|p| p.len()),
+            num_filters = filters.len(),
+            limit = ?limit,
+            "Creating static table scan"
+        );
+
         // Use cached table (no refresh)
         Ok(Arc::new(IcebergTableScan::new(
             self.table.clone(),

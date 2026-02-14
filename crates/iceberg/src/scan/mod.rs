@@ -186,6 +186,13 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
+        tracing::info!(
+            snapshot_id = ?self.snapshot_id,
+            has_filter = self.filter.is_some(),
+            column_selection = ?self.column_names.as_ref().map(|c| c.len()),
+            "Building table scan"
+        );
+
         let snapshot = match self.snapshot_id {
             Some(snapshot_id) => self
                 .table
@@ -217,6 +224,12 @@ impl<'a> TableScanBuilder<'a> {
         };
 
         let schema = snapshot.schema(self.table.metadata())?;
+
+        tracing::debug!(
+            snapshot_id = snapshot.snapshot_id(),
+            schema_fields = schema.as_struct().fields().len(),
+            "Resolved snapshot"
+        );
 
         // Check that all column names exist in the schema (skip reserved columns).
         if let Some(column_names) = self.column_names.as_ref() {
@@ -337,8 +350,14 @@ impl TableScan {
     /// Returns a stream of [`FileScanTask`]s.
     pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
         let Some(plan_context) = self.plan_context.as_ref() else {
+            tracing::debug!("No snapshot available, returning empty file plan");
             return Ok(Box::pin(futures::stream::empty()));
         };
+
+        tracing::info!(
+            snapshot_id = plan_context.snapshot.snapshot_id(),
+            "Planning files for table scan"
+        );
 
         let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
         let concurrency_limit_manifest_entries = self.concurrency_limit_manifest_entries;
@@ -432,6 +451,13 @@ impl TableScan {
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
+        tracing::debug!(
+            concurrency_limit_data_files = self.concurrency_limit_data_files,
+            row_group_filtering_enabled = self.row_group_filtering_enabled,
+            row_selection_enabled = self.row_selection_enabled,
+            "Converting table scan to arrow stream"
+        );
+
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
@@ -460,6 +486,10 @@ impl TableScan {
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
+            tracing::trace!(
+                file_path = %manifest_entry_context.manifest_entry.file_path(),
+                "Skipping dead manifest entry"
+            );
             return Ok(());
         }
 
@@ -488,6 +518,10 @@ impl TableScan {
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+                tracing::trace!(
+                    file_path = %manifest_entry_context.manifest_entry.file_path(),
+                    "Skipping manifest entry: partition pruned"
+                );
                 return Ok(());
             }
 
@@ -497,9 +531,19 @@ impl TableScan {
                 manifest_entry_context.manifest_entry.data_file(),
                 false,
             )? {
+                tracing::trace!(
+                    file_path = %manifest_entry_context.manifest_entry.file_path(),
+                    "Skipping manifest entry: metrics pruned"
+                );
                 return Ok(());
             }
         }
+
+        tracing::trace!(
+            file_path = %manifest_entry_context.manifest_entry.file_path(),
+            record_count = manifest_entry_context.manifest_entry.record_count(),
+            "Manifest entry passed all filters"
+        );
 
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
