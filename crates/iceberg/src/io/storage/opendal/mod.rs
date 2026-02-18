@@ -24,11 +24,11 @@ use async_trait::async_trait;
 #[cfg(feature = "storage-azdls")]
 use azdls::AzureStorageScheme;
 use bytes::Bytes;
-use opendal::layers::RetryLayer;
 #[cfg(feature = "io-metrics")]
-use opendal::layers::MetricsLayer;
+use opendal::layers::OtelMetricsLayer;
 #[cfg(feature = "io-tracing")]
-use opendal::layers::TracingLayer;
+use opendal::layers::OtelTraceLayer;
+use opendal::layers::RetryLayer;
 #[cfg(feature = "io-cache")]
 mod foyer_layer;
 #[cfg(feature = "io-cache")]
@@ -455,10 +455,13 @@ impl OpenDalStorage {
         };
 
         #[cfg(feature = "io-metrics")]
-        let operator = operator.layer(MetricsLayer::default());
+        let operator = {
+            let meter = opentelemetry::global::meter("opendal");
+            operator.layer(OtelMetricsLayer::builder().register(&meter))
+        };
 
         #[cfg(feature = "io-tracing")]
-        let operator = operator.layer(TracingLayer);
+        let operator = operator.layer(OtelTraceLayer);
 
         Ok((operator, relative_path))
     }

@@ -3656,6 +3656,7 @@ dependencies = [
  "murmur3",
  "once_cell",
  "opendal",
+ "opentelemetry",
  "ordered-float 4.6.0",
  "parquet",
  "pretty_assertions",
@@ -4506,16 +4507,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metrics"
-version = "0.24.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5312e9ba3771cfa961b585728215e3d972c950a3eed9252aa093d6301277e8"
-dependencies = [
- "ahash 0.8.12",
- "portable-atomic",
-]
-
-[[package]]
 name = "mimalloc"
 version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4925,7 +4916,7 @@ dependencies = [
  "jiff",
  "log",
  "md-5",
- "metrics",
+ "opentelemetry",
  "percent-encoding",
  "quick-xml 0.38.4",
  "reqsign",
@@ -4933,7 +4924,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
  "url",
  "uuid",
 ]
@@ -4943,6 +4933,20 @@ name = "openssl-probe"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
+
+[[package]]
+name = "opentelemetry"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.17",
+ "tracing",
+]
 
 [[package]]
 name = "option-ext"
