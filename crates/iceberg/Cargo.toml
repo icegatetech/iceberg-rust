@@ -39,6 +39,8 @@ storage-memory = ["opendal/services-memory"]
 storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3", "reqsign"]
 
+io-tracing = ["opendal/layers-tracing"]
+io-metrics = ["opendal/layers-metrics"]
 
 [dependencies]
 anyhow = { workspace = true }

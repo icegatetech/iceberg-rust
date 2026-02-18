@@ -25,6 +25,10 @@ use async_trait::async_trait;
 use azdls::AzureStorageScheme;
 use bytes::Bytes;
 use opendal::layers::RetryLayer;
+#[cfg(feature = "io-metrics")]
+use opendal::layers::MetricsLayer;
+#[cfg(feature = "io-tracing")]
+use opendal::layers::TracingLayer;
 #[cfg(feature = "storage-azdls")]
 use opendal::services::AzdlsConfig;
 #[cfg(feature = "storage-gcs")]
@@ -360,6 +364,13 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
+
+        #[cfg(feature = "io-metrics")]
+        let operator = operator.layer(MetricsLayer::default());
+
+        #[cfg(feature = "io-tracing")]
+        let operator = operator.layer(TracingLayer);
+
         Ok((operator, relative_path))
     }
 
