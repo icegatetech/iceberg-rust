@@ -437,15 +437,6 @@ impl OpenDalStorage {
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
 
-        #[cfg(feature = "io-metrics")]
-        let operator = {
-            let meter = opentelemetry::global::meter("opendal");
-            operator.layer(OtelMetricsLayer::builder().register(&meter))
-        };
-
-        #[cfg(feature = "io-tracing")]
-        let operator = operator.layer(OtelTraceLayer);
-
         // Apply foyer cache layer if present (S3-only for now).
         // Layer ordering: Retry → Cache → Metrics → Tracing
         // so that metrics/tracing observe cache hits/misses.
@@ -461,6 +452,15 @@ impl OpenDalStorage {
             } else {
                 operator
             }
+        };
+
+        #[cfg(feature = "io-tracing")]
+        let operator = operator.layer(OtelTraceLayer);
+
+        #[cfg(feature = "io-metrics")]
+        let operator = {
+            let meter = opentelemetry::global::meter("opendal");
+            operator.layer(OtelMetricsLayer::builder().register(&meter))
         };
 
         Ok((operator, relative_path))
