@@ -41,6 +41,7 @@ storage-s3 = ["opendal/services-s3", "reqsign"]
 
 io-tracing = ["opendal/layers-tracing"]
 io-metrics = ["opendal/layers-metrics"]
+io-cache = ["dep:foyer"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -78,6 +79,7 @@ reqsign = { version = "0.16.3", optional = true, default-features = false }
 reqwest = { workspace = true }
 roaring = { workspace = true }
 fastnum = { workspace = true }
+foyer = { version = "0.18", optional = true, features = ["serde"] }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_derive = { workspace = true }
