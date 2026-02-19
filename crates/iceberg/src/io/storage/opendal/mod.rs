@@ -32,7 +32,7 @@ use opendal::layers::RetryLayer;
 #[cfg(feature = "io-cache")]
 mod foyer_layer;
 #[cfg(feature = "io-cache")]
-use foyer_layer::FoyerLayer;
+pub use foyer_layer::FoyerLayer;
 #[cfg(feature = "storage-azdls")]
 use opendal::services::AzdlsConfig;
 #[cfg(feature = "storage-gcs")]
