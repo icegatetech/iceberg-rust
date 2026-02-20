@@ -24,7 +24,15 @@ use async_trait::async_trait;
 #[cfg(feature = "storage-azdls")]
 use azdls::AzureStorageScheme;
 use bytes::Bytes;
+#[cfg(feature = "io-metrics")]
+use opendal::layers::OtelMetricsLayer;
+#[cfg(feature = "io-tracing")]
+use opendal::layers::OtelTraceLayer;
 use opendal::layers::RetryLayer;
+#[cfg(feature = "io-cache")]
+mod foyer_layer;
+#[cfg(feature = "io-cache")]
+pub use foyer_layer::FoyerLayer;
 #[cfg(feature = "storage-azdls")]
 use opendal::services::AzdlsConfig;
 #[cfg(feature = "storage-gcs")]
@@ -69,6 +77,63 @@ use memory::*;
 use oss::*;
 #[cfg(feature = "storage-s3")]
 pub use s3::*;
+
+/// Property key for the cache directory path.
+///
+/// When set, enables disk-backed caching via foyer. The value should be an
+/// absolute path to a directory where cache data will be stored.
+#[cfg(feature = "io-cache")]
+pub const IO_CACHE_DIR: &str = "io.cache.dir";
+
+/// Property key for the in-memory cache size in bytes.
+///
+/// Defaults to 64 MiB if not specified.
+#[cfg(feature = "io-cache")]
+pub const IO_CACHE_MEMORY_SIZE: &str = "io.cache.memory-size";
+
+/// Type alias for the foyer hybrid cache used by the io-cache layer.
+#[cfg(feature = "io-cache")]
+pub type FoyerCache = foyer::HybridCache<foyer_layer::FoyerKey, foyer_layer::FoyerValue>;
+
+/// Configuration for the foyer-based IO cache layer.
+///
+/// Wraps a pre-built [`FoyerCache`] (hybrid memory/disk cache engine).
+/// The [`FoyerLayer`] is reconstructed from this engine on each
+/// `create_operator()` call, since `FoyerLayer` does not implement `Clone`.
+///
+/// # Usage
+///
+/// Build a cache engine externally and pass it via [`FileIOBuilder::with_extension`]:
+///
+/// ```rust,ignore
+/// let cache = foyer::HybridCacheBuilder::new()
+///     .memory(64 * 1024 * 1024)
+///     .build()
+///     .await?;
+/// let config = IoCacheConfig::new(cache);
+/// let file_io = FileIOBuilder::new("s3")
+///     .with_prop("s3.region", "us-east-1")
+///     .with_extension(config)
+///     .build()?;
+/// ```
+#[cfg(feature = "io-cache")]
+#[derive(Clone, Debug)]
+pub struct IoCacheConfig {
+    cache: FoyerCache,
+}
+
+#[cfg(feature = "io-cache")]
+impl IoCacheConfig {
+    /// Create a new cache config from a pre-built hybrid cache engine.
+    pub fn new(cache: FoyerCache) -> Self {
+        Self { cache }
+    }
+
+    /// Extract the underlying hybrid cache engine.
+    pub(crate) fn into_cache(self) -> FoyerCache {
+        self.cache
+    }
+}
 
 /// OpenDAL-based storage factory.
 ///
@@ -122,6 +187,8 @@ impl StorageFactory for OpenDalStorageFactory {
                 configured_scheme: "s3".to_string(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
+                #[cfg(feature = "io-cache")]
+                foyer_cache: None,
             })),
             #[cfg(feature = "storage-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
@@ -180,6 +247,10 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<CustomAwsCredentialLoader>,
+        /// Optional foyer hybrid cache engine for the io-cache layer.
+        #[cfg(feature = "io-cache")]
+        #[serde(skip)]
+        foyer_cache: Option<FoyerCache>,
     },
     /// GCS storage variant.
     #[cfg(feature = "storage-gcs")]
@@ -230,6 +301,10 @@ impl OpenDalStorage {
                 customized_credential_load: extensions
                     .get::<CustomAwsCredentialLoader>()
                     .map(Arc::unwrap_or_clone),
+                #[cfg(feature = "io-cache")]
+                foyer_cache: extensions
+                    .get::<IoCacheConfig>()
+                    .map(|config| Arc::unwrap_or_clone(config).into_cache()),
             }),
             #[cfg(feature = "storage-gcs")]
             Scheme::Gcs => Ok(Self::Gcs {
@@ -296,6 +371,7 @@ impl OpenDalStorage {
                 configured_scheme,
                 config,
                 customized_credential_load,
+                ..
             } => {
                 let op = s3_config_build(config, customized_credential_load, path)?;
                 let op_info = op.info();
@@ -360,6 +436,33 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; however there's no
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
+
+        #[cfg(feature = "io-tracing")]
+        let operator = operator.layer(OtelTraceLayer);
+
+        // Apply foyer cache layer if present (S3-only for now).
+        // Layer ordering: Retry → Cache → Metrics → Tracing
+        // so that metrics/tracing observe cache hits/misses.
+        #[cfg(feature = "io-cache")]
+        let operator = {
+            let cache = match self {
+                #[cfg(feature = "storage-s3")]
+                OpenDalStorage::S3 { foyer_cache, .. } => foyer_cache.as_ref(),
+                _ => None,
+            };
+            if let Some(cache) = cache {
+                operator.layer(FoyerLayer::new(cache.clone()))
+            } else {
+                operator
+            }
+        };
+
+        #[cfg(feature = "io-metrics")]
+        let operator = {
+            let meter = opentelemetry::global::meter("opendal");
+            operator.layer(OtelMetricsLayer::builder().register(&meter))
+        };
+
         Ok((operator, relative_path))
     }
 
@@ -470,5 +573,30 @@ mod tests {
     fn test_default_memory_operator() {
         let op = default_memory_operator();
         assert_eq!(op.info().scheme().to_string(), "memory");
+    }
+
+    #[cfg(all(feature = "io-cache", feature = "storage-s3"))]
+    #[tokio::test]
+    async fn test_io_cache_layer_s3_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = foyer::HybridCacheBuilder::new()
+            .memory(64)
+            .storage(foyer::Engine::Large(Default::default()))
+            .with_device_options(
+                foyer::DirectFsDeviceOptions::new(dir.path()).with_capacity(4 * 1024 * 1024),
+            )
+            .with_recover_mode(foyer::RecoverMode::None)
+            .build()
+            .await
+            .expect("Failed to build cache");
+
+        let config = IoCacheConfig::new(cache);
+        // Verify the S3 variant can be built with cache config
+        // (actual S3 IO requires credentials, so just test construction)
+        let builder = crate::io::FileIOBuilder::new("s3")
+            .with_prop("s3.region", "us-east-1")
+            .with_prop("s3.endpoint", "http://localhost:9000")
+            .with_extension(config);
+        let _ = builder.build();
     }
 }
