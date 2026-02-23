@@ -27,9 +27,11 @@ use std::ops::{Bound, Deref, Range, RangeBounds};
 use std::sync::Arc;
 
 use foyer::{Code, CodeError, Error as FoyerError, HybridCache};
-use opendal::raw::oio;
-use opendal::raw::*;
-use opendal::*;
+use opendal::raw::{
+    Access, AccessorInfo, BytesContentRange, BytesRange, Layer, LayeredAccess, MaybeSend, OpDelete,
+    OpList, OpRead, OpStat, OpWrite, RpDelete, RpList, RpRead, RpWrite, oio,
+};
+use opendal::{Buffer, Error, ErrorKind, Metadata, Result};
 
 /// Key for the foyer cache, encoded via bincode (foyer's "serde" feature).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -59,9 +61,7 @@ impl Code for FoyerValue {
     }
 
     fn decode(reader: &mut impl std::io::Read) -> std::result::Result<Self, CodeError>
-    where
-        Self: Sized,
-    {
+    where Self: Sized {
         let mut len_bytes = [0u8; 8];
         reader.read_exact(&mut len_bytes)?;
         let len = u64::from_le_bytes(len_bytes) as usize;
@@ -189,6 +189,10 @@ impl<A: Access> LayeredAccess for FoyerAccessor<A> {
 }
 
 // --- FullReader: caches entire objects, slices to requested range ---
+//
+// NOTE: On a cache miss, the entire object is fetched into memory before the
+// requested byte range is sliced out.  Configure `with_size_limit()` on
+// `FoyerLayer` to avoid pulling very large objects into the cache.
 
 struct FullReader<A: Access> {
     inner: Arc<Inner<A>>,
@@ -200,6 +204,12 @@ impl<A: Access> FullReader<A> {
         Self { inner, size_limit }
     }
 
+    /// Reads the requested byte range from the cache (or backend on miss).
+    ///
+    /// **Cache-miss behaviour:** the *entire* object is fetched into memory so
+    /// it can be cached for future reads; only the requested range is returned
+    /// to the caller.  Use [`FoyerLayer::with_size_limit`] to cap the maximum
+    /// object size eligible for caching and avoid excessive memory usage.
     async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Buffer)> {
         let path_str = path.to_string();
         let version = args.version().map(|v| v.to_string());
@@ -245,8 +255,9 @@ impl<A: Access> FullReader<A> {
                             )
                             .await
                             .map_err(FoyerError::other)?;
-                        let buffer =
-                            oio::Read::read_all(&mut reader).await.map_err(FoyerError::other)?;
+                        let buffer = oio::Read::read_all(&mut reader)
+                            .await
+                            .map_err(FoyerError::other)?;
 
                         Ok(FoyerValue(buffer))
                     }
@@ -257,6 +268,9 @@ impl<A: Access> FullReader<A> {
         match result {
             Ok(entry) => {
                 let end = range_end.unwrap_or(entry.len() as u64);
+                if end <= range_start {
+                    return Ok((RpRead::new().with_size(Some(0)), Buffer::new()));
+                }
                 let range = BytesContentRange::default()
                     .with_range(range_start, end - 1)
                     .with_size(entry.len() as _);
@@ -304,9 +318,8 @@ impl<A: Access> FoyerWriter<A> {
 
 impl<A: Access> oio::Write for FoyerWriter<A> {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
-        if self.size_limit.contains(&(self.buf.len() + bs.len())) {
+        if !self.skip_cache && self.size_limit.contains(&(self.buf.len() + bs.len())) {
             self.buf.push(bs.clone());
-            self.skip_cache = false;
         } else {
             self.buf.clear();
             self.skip_cache = true;
@@ -367,7 +380,7 @@ impl<A: Access> oio::Delete for FoyerDeleter<A> {
     // flush executes queued deletions, then removes entries from cache.
     async fn flush(&mut self) -> Result<usize> {
         let count = self.deleter.flush().await?;
-        for key in self.keys.drain(..) {
+        for key in self.keys.drain(..count) {
             self.inner.cache.remove(&key);
         }
         Ok(count)

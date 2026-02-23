@@ -40,7 +40,7 @@ storage-oss = ["opendal/services-oss"]
 storage-s3 = ["opendal/services-s3", "reqsign"]
 
 io-tracing = ["opendal/layers-otel-trace", "opentelemetry"]
-io-metrics = ["opendal/layers-otel-metrics"]
+io-metrics = ["opendal/layers-otel-metrics", "opentelemetry"]
 io-cache = ["dep:foyer"]
 
 [dependencies]
