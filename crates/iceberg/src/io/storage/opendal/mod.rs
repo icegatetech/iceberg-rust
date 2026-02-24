@@ -110,7 +110,7 @@ pub type FoyerCache = foyer::HybridCache<foyer_layer::FoyerKey, foyer_layer::Foy
 ///     .memory(64 * 1024 * 1024)
 ///     .build()
 ///     .await?;
-/// let config = IoCacheConfig::new(cache);
+/// let config = IoCacheExtension::new(cache);
 /// let file_io = FileIOBuilder::new("s3")
 ///     .with_prop("s3.region", "us-east-1")
 ///     .with_extension(config)
@@ -118,12 +118,12 @@ pub type FoyerCache = foyer::HybridCache<foyer_layer::FoyerKey, foyer_layer::Foy
 /// ```
 #[cfg(feature = "io-cache")]
 #[derive(Clone, Debug)]
-pub struct IoCacheConfig {
+pub struct IoCacheExtension {
     cache: FoyerCache,
 }
 
 #[cfg(feature = "io-cache")]
-impl IoCacheConfig {
+impl IoCacheExtension {
     /// Create a new cache config from a pre-built hybrid cache engine.
     pub fn new(cache: FoyerCache) -> Self {
         Self { cache }
@@ -303,7 +303,7 @@ impl OpenDalStorage {
                     .map(Arc::unwrap_or_clone),
                 #[cfg(feature = "io-cache")]
                 foyer_cache: extensions
-                    .get::<IoCacheConfig>()
+                    .get::<IoCacheExtension>()
                     .map(|config| Arc::unwrap_or_clone(config).into_cache()),
             }),
             #[cfg(feature = "storage-gcs")]
@@ -590,7 +590,7 @@ mod tests {
             .await
             .expect("Failed to build cache");
 
-        let config = IoCacheConfig::new(cache);
+        let config = IoCacheExtension::new(cache);
         // Verify the S3 variant can be built with cache config
         // (actual S3 IO requires credentials, so just test construction)
         let builder = crate::io::FileIOBuilder::new("s3")
