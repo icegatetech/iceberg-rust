@@ -503,7 +503,8 @@ mod tests {
     async fn test_with_size_limit_excluded_usize_max_start() {
         let cache = build_test_cache().await;
         // Bound::Excluded(usize::MAX) for start — previously panicked on overflow
-        let layer = FoyerLayer::new(cache).with_size_limit((Bound::Excluded(usize::MAX), Bound::Unbounded));
+        let layer =
+            FoyerLayer::new(cache).with_size_limit((Bound::Excluded(usize::MAX), Bound::Unbounded));
         assert_eq!(layer.size_limit, usize::MAX..usize::MAX);
     }
 
