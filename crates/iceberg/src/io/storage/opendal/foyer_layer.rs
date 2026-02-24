@@ -101,11 +101,11 @@ impl FoyerLayer {
     pub fn with_size_limit<R: RangeBounds<usize>>(mut self, size_limit: R) -> Self {
         let start = match size_limit.start_bound() {
             Bound::Included(v) => *v,
-            Bound::Excluded(v) => *v + 1,
+            Bound::Excluded(v) => v.saturating_add(1),
             Bound::Unbounded => 0,
         };
         let end = match size_limit.end_bound() {
-            Bound::Included(v) => *v + 1,
+            Bound::Included(v) => v.saturating_add(1),
             Bound::Excluded(v) => *v,
             Bound::Unbounded => usize::MAX,
         };
@@ -267,7 +267,8 @@ impl<A: Access> FullReader<A> {
 
         match result {
             Ok(entry) => {
-                let end = range_end.unwrap_or(entry.len() as u64);
+                let entry_len = entry.len() as u64;
+                let end = range_end.unwrap_or(entry_len).min(entry_len);
                 if end <= range_start {
                     return Ok((RpRead::new().with_size(Some(0)), Buffer::new()));
                 }
@@ -331,9 +332,9 @@ impl<A: Access> oio::Write for FoyerWriter<A> {
     }
 
     async fn close(&mut self) -> Result<Metadata> {
-        let buffer = self.buf.clone().collect();
         let metadata = self.w.close().await?;
         if !self.skip_cache {
+            let buffer = self.buf.clone().collect();
             self.inner.cache.insert(
                 FoyerKey {
                     path: self.path.clone(),
