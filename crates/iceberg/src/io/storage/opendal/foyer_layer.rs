@@ -318,11 +318,14 @@ impl<A: Access> FoyerWriter<A> {
 
 impl<A: Access> oio::Write for FoyerWriter<A> {
     async fn write(&mut self, bs: Buffer) -> Result<()> {
-        if !self.skip_cache && self.size_limit.contains(&(self.buf.len() + bs.len())) {
-            self.buf.push(bs.clone());
-        } else {
-            self.buf.clear();
-            self.skip_cache = true;
+        // Once skip_cache is set it stays true for the rest of the write session.
+        if !self.skip_cache {
+            if self.size_limit.contains(&(self.buf.len() + bs.len())) {
+                self.buf.push(bs.clone());
+            } else {
+                self.buf.clear();
+                self.skip_cache = true;
+            }
         }
         self.w.write(bs).await
     }

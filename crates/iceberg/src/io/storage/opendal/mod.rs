@@ -78,19 +78,6 @@ use oss::*;
 #[cfg(feature = "storage-s3")]
 pub use s3::*;
 
-/// Property key for the cache directory path.
-///
-/// When set, enables disk-backed caching via foyer. The value should be an
-/// absolute path to a directory where cache data will be stored.
-#[cfg(feature = "io-cache")]
-pub const IO_CACHE_DIR: &str = "io.cache.dir";
-
-/// Property key for the in-memory cache size in bytes.
-///
-/// Defaults to 64 MiB if not specified.
-#[cfg(feature = "io-cache")]
-pub const IO_CACHE_MEMORY_SIZE: &str = "io.cache.memory-size";
-
 /// Type alias for the foyer hybrid cache used by the io-cache layer.
 #[cfg(feature = "io-cache")]
 pub type FoyerCache = foyer::HybridCache<foyer_layer::FoyerKey, foyer_layer::FoyerValue>;
@@ -441,8 +428,6 @@ impl OpenDalStorage {
         let operator = operator.layer(OtelTraceLayer);
 
         // Apply foyer cache layer if present (S3-only for now).
-        // Layer ordering: Retry → Cache → Metrics → Tracing
-        // so that metrics/tracing observe cache hits/misses.
         #[cfg(feature = "io-cache")]
         let operator = {
             let cache = match self {
@@ -597,6 +582,8 @@ mod tests {
             .with_prop("s3.region", "us-east-1")
             .with_prop("s3.endpoint", "http://localhost:9000")
             .with_extension(config);
-        let _ = builder.build();
+        builder
+            .build()
+            .expect("Failed to build S3 FileIO with IoCacheExtension");
     }
 }
