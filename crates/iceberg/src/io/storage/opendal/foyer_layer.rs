@@ -22,6 +22,7 @@
 //! built-in `FoyerLayer`, this module should be replaced by enabling the
 //! `layers-foyer` feature on opendal directly.
 
+use std::cmp::min;
 use std::future::Future;
 use std::ops::{Bound, Deref, Range, RangeBounds};
 use std::sync::Arc;
@@ -32,6 +33,12 @@ use opendal::raw::{
     OpList, OpRead, OpStat, OpWrite, RpDelete, RpList, RpRead, RpWrite, oio,
 };
 use opendal::{Buffer, Error, ErrorKind, Metadata, Result};
+
+/// Maximum size (in bytes) that [`FoyerValue::decode`] will allocate.
+///
+/// Guards against corrupted on-disk cache entries that encode an unreasonably
+/// large length prefix, which would otherwise cause an OOM.
+const MAX_FOYER_VALUE_SIZE: usize = 1 << 30; // 1 GiB
 
 /// Key for the foyer cache, encoded via bincode (foyer's "serde" feature).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -64,7 +71,14 @@ impl Code for FoyerValue {
     where Self: Sized {
         let mut len_bytes = [0u8; 8];
         reader.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
+        let len: usize = u64::from_le_bytes(len_bytes)
+            .try_into()
+            .map_err(|e| CodeError::from(std::io::Error::other(e)))?;
+        if len > MAX_FOYER_VALUE_SIZE {
+            return Err(CodeError::from(std::io::Error::other(format!(
+                "foyer cache entry size {len} exceeds maximum {MAX_FOYER_VALUE_SIZE}"
+            ))));
+        }
         let mut buffer = vec![0u8; len];
         reader.read_exact(&mut buffer[..len])?;
         Ok(FoyerValue(buffer.into()))
@@ -218,7 +232,17 @@ impl<A: Access> FullReader<A> {
         let (range_start, range_end) = {
             let r = args.range();
             let start = r.offset();
-            let end = r.size().map(|size| start + size);
+            let end = r
+                .size()
+                .map(|size| {
+                    start.checked_add(size).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            format!("range overflow: offset {start} + size {size} exceeds u64"),
+                        )
+                    })
+                })
+                .transpose()?;
             (start, end)
         };
 
@@ -328,7 +352,12 @@ impl<A: Access> oio::Write for FoyerWriter<A> {
                 self.skip_cache = true;
             }
         }
-        self.w.write(bs).await
+        let result = self.w.write(bs).await;
+        if result.is_err() && !self.skip_cache {
+            self.buf.clear();
+            self.skip_cache = true;
+        }
+        result
     }
 
     async fn close(&mut self) -> Result<Metadata> {
@@ -384,7 +413,8 @@ impl<A: Access> oio::Delete for FoyerDeleter<A> {
     // flush executes queued deletions, then removes entries from cache.
     async fn flush(&mut self) -> Result<usize> {
         let count = self.deleter.flush().await?;
-        for key in self.keys.drain(..count) {
+        let n = min(count, self.keys.len());
+        for key in self.keys.drain(..n) {
             self.inner.cache.remove(&key);
         }
         Ok(count)
@@ -408,5 +438,98 @@ fn extract_err(e: FoyerError) -> Error {
     match e.downcast::<Error>() {
         Ok(e) => e,
         Err(e) => Error::new(ErrorKind::Unexpected, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- FoyerValue encode/decode ---
+
+    #[test]
+    fn test_foyer_value_encode_decode_roundtrip() {
+        let original = FoyerValue(Buffer::from(vec![1u8, 2, 3, 4, 5]));
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded).unwrap();
+        let decoded = FoyerValue::decode(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.0.to_vec(), vec![1u8, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_foyer_value_encode_decode_empty() {
+        let original = FoyerValue(Buffer::new());
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded).unwrap();
+        let decoded = FoyerValue::decode(&mut &encoded[..]).unwrap();
+        assert!(decoded.0.is_empty());
+    }
+
+    #[test]
+    fn test_foyer_value_decode_rejects_oversized_length() {
+        let huge_len = (MAX_FOYER_VALUE_SIZE as u64) + 1;
+        let data = huge_len.to_le_bytes();
+        let result = FoyerValue::decode(&mut &data[..]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_foyer_value_decode_rejects_u64_exceeding_usize() {
+        // On 64-bit this won't differ from the size cap test, but the
+        // try_into guard is still exercised for correctness.
+        let huge_len: u64 = u64::MAX;
+        let data = huge_len.to_le_bytes();
+        let result = FoyerValue::decode(&mut &data[..]);
+        assert!(result.is_err());
+    }
+
+    // --- with_size_limit saturating arithmetic ---
+
+    async fn build_test_cache() -> HybridCache<FoyerKey, FoyerValue> {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        foyer::HybridCacheBuilder::new()
+            .memory(64)
+            .storage(foyer::Engine::Large(Default::default()))
+            .with_device_options(
+                foyer::DirectFsDeviceOptions::new(dir.path()).with_capacity(4 * 1024 * 1024),
+            )
+            .with_recover_mode(foyer::RecoverMode::None)
+            .build()
+            .await
+            .expect("failed to build test cache")
+    }
+
+    #[tokio::test]
+    async fn test_with_size_limit_excluded_usize_max_start() {
+        let cache = build_test_cache().await;
+        // Bound::Excluded(usize::MAX) for start — previously panicked on overflow
+        let layer = FoyerLayer::new(cache).with_size_limit((Bound::Excluded(usize::MAX), Bound::Unbounded));
+        assert_eq!(layer.size_limit, usize::MAX..usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_with_size_limit_included_usize_max_end() {
+        let cache = build_test_cache().await;
+        // Bound::Included(usize::MAX) for end — previously panicked on overflow
+        let layer = FoyerLayer::new(cache).with_size_limit(..=usize::MAX);
+        assert_eq!(layer.size_limit, 0..usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_with_size_limit_normal_range() {
+        let cache = build_test_cache().await;
+        let layer = FoyerLayer::new(cache).with_size_limit(10..1000);
+        assert_eq!(layer.size_limit, 10..1000);
+    }
+
+    // --- flush clamp ---
+
+    #[test]
+    fn test_drain_clamp_logic() {
+        // Simulates the clamping logic in flush: min(count, keys.len())
+        let keys = vec![1, 2, 3];
+        let count = 5usize; // exceeds keys.len()
+        let n = min(count, keys.len());
+        assert_eq!(n, 3);
     }
 }
