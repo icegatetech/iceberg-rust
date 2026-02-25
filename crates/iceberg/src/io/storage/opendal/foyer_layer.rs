@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn test_drain_clamp_logic() {
         // Simulates the clamping logic in flush: min(count, keys.len())
-        let keys = vec![1, 2, 3];
+        let keys = [1, 2, 3];
         let count = 5usize; // exceeds keys.len()
         let n = min(count, keys.len());
         assert_eq!(n, 3);
