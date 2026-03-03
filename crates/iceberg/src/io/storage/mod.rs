@@ -33,7 +33,7 @@ pub use memory::{MemoryStorage, MemoryStorageFactory};
 #[cfg(feature = "storage-s3")]
 pub use opendal::CustomAwsCredentialLoader;
 #[cfg(feature = "io-cache")]
-pub use opendal::{FoyerCache, FoyerLayer, IoCacheExtension};
+pub use opendal::{FoyerCache, FoyerKey, FoyerLayer, FoyerValue, IoCacheExtension};
 pub use opendal::{OpenDalStorage, OpenDalStorageFactory};
 
 use super::{FileMetadata, FileRead, FileWrite, InputFile, OutputFile};
