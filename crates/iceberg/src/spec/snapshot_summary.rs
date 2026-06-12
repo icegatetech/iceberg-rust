@@ -337,6 +337,7 @@ pub(crate) fn update_snapshot_summaries(
 ) -> Result<Summary> {
     // Validate that the operation is supported
     if summary.operation != Operation::Append
+        && summary.operation != Operation::Replace
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
     {

@@ -66,6 +66,15 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Returns the data files removed by this operation, for snapshot-summary
+    /// accounting so the snapshot totals reflect both added and removed files.
+    ///
+    /// Defaults to none — e.g. an append removes nothing. A `replace`/rewrite
+    /// operation returns the files it drops so the totals stay correct.
+    fn removed_data_files(&self) -> &[DataFile] {
+        &[]
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -114,6 +123,11 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // Summary-property keys to carry forward unchanged from the parent (the base's
+    // current snapshot) when they are not set explicitly in `snapshot_properties`.
+    // Resolved at production time, so under the commit retry they reflect the
+    // refreshed base rather than a value captured before a racing commit.
+    inherit_summary_keys: Vec<String>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -135,8 +149,17 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            inherit_summary_keys: vec![],
             manifest_counter: (0..),
         }
+    }
+
+    /// Carry forward the given summary-property keys from the parent snapshot
+    /// (the base's current snapshot) when they are absent from
+    /// `snapshot_properties`. See [`RewriteFilesAction::inherit_summary_property`].
+    pub(crate) fn with_inherit_summary_keys(mut self, keys: Vec<String>) -> Self {
+        self.inherit_summary_keys = keys;
+        self
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -254,6 +277,43 @@ impl<'a> SnapshotProducer<'a> {
                 ManifestContentType::Data => Ok(builder.build_v3_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
             },
+        }
+    }
+
+    /// Create a data manifest writer for re-emitting surviving entries while a
+    /// `replace`/rewrite operation rebuilds an affected manifest.
+    ///
+    /// Unlike [`Self::new_manifest_writer`], this takes `&self` and generates a
+    /// unique random suffix instead of advancing the shared `manifest_counter`, so
+    /// it is callable from the `&self`-only
+    /// [`SnapshotProduceOperation::existing_manifest`](crate::transaction::snapshot::SnapshotProduceOperation::existing_manifest)
+    /// hook. The rewritten manifest is attributed to the new snapshot, while each
+    /// surviving entry keeps its original snapshot id and data sequence number.
+    pub(crate) fn new_rewrite_manifest_writer(&self) -> Result<ManifestWriter> {
+        let new_manifest_path = format!(
+            "{}/{}/{}-rewrite-{}.{}",
+            self.table.metadata().location(),
+            META_ROOT_PATH,
+            self.commit_uuid,
+            Uuid::now_v7(),
+            DataFileFormat::Avro
+        );
+        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        let builder = ManifestWriterBuilder::new(
+            output_file,
+            Some(self.snapshot_id),
+            self.key_metadata.clone(),
+            self.table.metadata().current_schema().clone(),
+            self.table
+                .metadata()
+                .default_partition_spec()
+                .as_ref()
+                .clone(),
+        );
+        match self.table.metadata().format_version() {
+            FormatVersion::V1 => Ok(builder.build_v1()),
+            FormatVersion::V2 => Ok(builder.build_v2_data()),
+            FormatVersion::V3 => Ok(builder.build_v3_data()),
         }
     }
 
@@ -382,14 +442,39 @@ impl<'a> SnapshotProducer<'a> {
                 table_metadata.default_partition_spec().clone(),
             );
         }
+        for data_file in snapshot_produce_operation.removed_data_files() {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // The new snapshot being produced is not yet part of the table metadata, so
+        // its parent is the table's current snapshot. Use that as the base for the
+        // cumulative-total deltas (added minus removed); the previous lookup keyed on
+        // the not-yet-committed snapshot id always resolved to `None`, which left the
+        // totals computed from a zero base and could underflow on a `replace`.
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
+
+        // Carry forward inherited summary keys from the parent (the base's current
+        // snapshot — the FRESH base under the commit-conflict retry), unless the
+        // caller set them explicitly. This lets an operation such as a `replace`
+        // preserve a monotonic marker (e.g. a write-ahead-log offset) resolved
+        // against the snapshot it actually supersedes, never a value captured
+        // before a concurrent commit changed the base.
+        if let Some(previous) = previous_snapshot {
+            for key in &self.inherit_summary_keys {
+                if !additional_properties.contains_key(key) {
+                    if let Some(value) = previous.summary().additional_properties.get(key) {
+                        additional_properties.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
 
         let summary = Summary {
             operation: snapshot_produce_operation.operation(),
