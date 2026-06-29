@@ -759,6 +759,20 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             let array = FixedSizeBinaryArray::try_from_iter(vec![bytes].into_iter()).unwrap();
             Ok(Arc::new(Scalar::new(array)))
         }
+        (PrimitiveType::Fixed(_), PrimitiveLiteral::Binary(value)) => {
+            // `Fixed(n)` maps to Arrow `FixedSizeBinary(n)`; the scalar's width
+            // is inferred from the single value, matching the column so the
+            // Arrow comparison kernels in the row filter type-check.
+            let array = FixedSizeBinaryArray::try_from_iter(vec![value.clone()].into_iter())
+                .map_err(|err| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Failed to build FixedSizeBinary scalar from Fixed datum",
+                    )
+                    .with_source(err)
+                })?;
+            Ok(Arc::new(Scalar::new(array)))
+        }
 
         (primitive_type, _) => Err(Error::new(
             ErrorKind::FeatureUnsupported,
@@ -2150,6 +2164,19 @@ mod tests {
                 .unwrap();
             assert!(is_scalar);
             assert_eq!(array.value(0), [66u8; 16]);
+        }
+        {
+            // Fixed(n) -> FixedSizeBinary(n) scalar; width inferred from the value.
+            let datum = Datum::fixed(vec![7u8; 16]);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value_length(), 16);
+            assert_eq!(array.value(0), [7u8; 16]);
         }
     }
 
