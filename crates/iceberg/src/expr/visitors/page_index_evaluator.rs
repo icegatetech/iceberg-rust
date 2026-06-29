@@ -362,12 +362,27 @@ impl<'a> PageIndexEvaluator<'a> {
                     )
                 })
                 .collect(),
-            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'FIXED_LEN_BYTE_ARRAY' index type in column_index",
-                ));
-            }
+            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx) => idx
+                .min_values_iter()
+                .zip(idx.max_values_iter())
+                .enumerate()
+                .zip(row_counts.iter())
+                .map(|((i, (min, max)), &row_count)| {
+                    // `field_type` is `Fixed(n)`; pair it with a Binary literal so
+                    // the resulting Datum is `Fixed`-typed and comparable to the
+                    // pushed-down predicate's `Fixed` datum (Datum ordering only
+                    // compares same-type pairs).
+                    predicate(
+                        min.map(|val| {
+                            Datum::new(field_type.clone(), PrimitiveLiteral::Binary(val.to_vec()))
+                        }),
+                        max.map(|val| {
+                            Datum::new(field_type.clone(), PrimitiveLiteral::Binary(val.to_vec()))
+                        }),
+                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
+                    )
+                })
+                .collect(),
             ColumnIndexMetaData::INT96(_) => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
@@ -779,7 +794,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, FixedSizeBinaryArray, Float32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::{
@@ -1360,5 +1375,79 @@ mod tests {
         let field_id_map = HashMap::from_iter([(1, 0), (2, 1)]);
 
         Ok((iceberg_schema_ref, field_id_map))
+    }
+
+    /// Two-page Parquet file with a single `FixedSizeBinary(4)` column:
+    /// page 1 is all `[0,0,0,1]`, page 2 is all `[0,0,0,2]`.
+    fn create_test_parquet_file_fixed() -> Result<(Arc<ParquetMetaData>, NamedTempFile)> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "col_fixed",
+            DataType::FixedSizeBinary(4),
+            false,
+        )]));
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let file = temp_file.reopen().unwrap();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(1024)
+            .set_write_batch_size(512)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+
+        for value in [[0u8, 0, 0, 1], [0u8, 0, 0, 2]] {
+            let array = FixedSizeBinaryArray::try_from_iter(vec![value; 1024].into_iter()).unwrap();
+            let batch =
+                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array) as ArrayRef])
+                    .unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+
+        let file = temp_file.reopen().unwrap();
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
+        let metadata = reader.metadata().clone();
+        Ok((metadata, temp_file))
+    }
+
+    #[test]
+    fn eval_eq_fixed_selects_only_matching_page() -> Result<()> {
+        let (metadata, _temp_file) = create_test_parquet_file_fixed()?;
+        let row_group_metadata = metadata.row_group(0);
+        let column_index = metadata.column_index().unwrap()[0].to_vec();
+        let offset_index = metadata.offset_index().unwrap()[0].to_vec();
+
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_fields([Arc::new(NestedField::new(
+                    1,
+                    "col_fixed",
+                    Type::Primitive(PrimitiveType::Fixed(4)),
+                    false,
+                ))])
+                .build()?,
+        );
+        let field_id_map = HashMap::from_iter([(1, 0)]);
+
+        // Equality on the page-2 value must skip page 1 and select page 2.
+        let filter = Reference::new("col_fixed")
+            .equal_to(Datum::fixed(vec![0u8, 0, 0, 2]))
+            .bind(iceberg_schema.clone(), false)?;
+
+        let result = PageIndexEvaluator::eval(
+            &filter,
+            &column_index,
+            &offset_index,
+            row_group_metadata,
+            &field_id_map,
+            iceberg_schema.as_ref(),
+        )?;
+
+        assert_eq!(result, vec![
+            RowSelector::skip(1024),
+            RowSelector::select(1024),
+        ]);
+
+        Ok(())
     }
 }
