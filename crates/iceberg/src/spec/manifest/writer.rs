@@ -246,6 +246,11 @@ impl ManifestWriter {
         }
     }
 
+    /// See [row lineage](https://iceberg.apache.org/spec/#row-lineage).
+    pub(crate) fn set_first_row_id(&mut self, first_row_id: Option<u64>) {
+        self.first_row_id = first_row_id;
+    }
+
     fn construct_partition_summaries(
         &mut self,
         partition_type: &StructType,

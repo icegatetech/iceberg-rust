@@ -64,6 +64,16 @@ pub enum ErrorKind {
 
     /// Catalog commit failed due to outdated metadata
     CatalogCommitConflicts,
+
+    /// A metadata-maintenance operation determined it has nothing worthwhile to
+    /// do and deliberately wrote nothing.
+    ///
+    /// Returned instead of a generic [`DataInvalid`](Self::DataInvalid) so a
+    /// caller (e.g. a maintenance job) can recognize a benign no-op by kind —
+    /// without matching on the error message — and treat it as a successful
+    /// skip rather than a failure. It is never retryable. `rewrite_manifests`
+    /// raises it when repacking would not strictly reduce the manifest count.
+    NoReduction,
 }
 
 impl ErrorKind {
@@ -85,6 +95,7 @@ impl From<ErrorKind> for &'static str {
             ErrorKind::NamespaceNotFound => "NamespaceNotFound",
             ErrorKind::PreconditionFailed => "PreconditionFailed",
             ErrorKind::CatalogCommitConflicts => "CatalogCommitConflicts",
+            ErrorKind::NoReduction => "NoReduction",
         }
     }
 }

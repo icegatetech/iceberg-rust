@@ -55,7 +55,8 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
-mod rewrite;
+mod rewrite_files;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -76,7 +77,8 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
-use crate::transaction::rewrite::RewriteFilesAction;
+use crate::transaction::rewrite_files::RewriteFilesAction;
+use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -158,6 +160,17 @@ impl Transaction {
     /// for compaction; it commits through any [`Catalog`] implementation.
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new()
+    }
+
+    /// Creates a rewrite-manifests action that repacks the small DATA manifests of
+    /// the current snapshot into fewer, larger ones, producing a `replace`
+    /// snapshot. It rewrites only table metadata — never data files or delete
+    /// manifests — and commits through any [`Catalog`] implementation. The caller
+    /// names the input manifests; packing, grouping, and validation re-run against
+    /// the fresh base on each retry, and an input no longer live in the current
+    /// snapshot fails the commit.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
@@ -339,6 +352,21 @@ mod tests {
     }
 
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
+        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V3).await
+    }
+
+    /// Create a V2 minimal table in `catalog`, reusing the version-independent
+    /// schema/spec/sort of the V3 minimal fixture so the shared `file()`/`data_file()`
+    /// test builders (spec 0, identity `x`) stay compatible. Used to exercise the
+    /// V1/V2 (no row lineage) paths and the V2→V3 upgrade carry-over.
+    pub(crate) async fn make_v2_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
+        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V2).await
+    }
+
+    async fn make_minimal_table_in_catalog(
+        catalog: &impl Catalog,
+        format_version: crate::spec::FormatVersion,
+    ) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
                 .unwrap();
@@ -362,7 +390,7 @@ mod tests {
             .partition_spec((**base_metadata.default_partition_spec()).clone())
             .sort_order((**base_metadata.default_sort_order()).clone())
             .name(table_ident.name().to_string())
-            .format_version(crate::spec::FormatVersion::V3)
+            .format_version(format_version)
             .build();
 
         catalog
