@@ -23,6 +23,9 @@ build:
 check-fmt:
 	cargo  fmt --all -- --check
 
+fix-fmt:
+	cargo fmt
+
 check-clippy:
 	cargo  clippy --all-targets --all-features --workspace -- -D warnings
 
