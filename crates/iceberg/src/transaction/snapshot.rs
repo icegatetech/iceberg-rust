@@ -24,9 +24,10 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary,
-    TableProperties, update_snapshot_summaries,
+    ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
+    Operation, PartitionSpec, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
+    update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -289,7 +290,20 @@ impl<'a> SnapshotProducer<'a> {
     /// [`SnapshotProduceOperation::existing_manifest`](crate::transaction::snapshot::SnapshotProduceOperation::existing_manifest)
     /// hook. The rewritten manifest is attributed to the new snapshot, while each
     /// surviving entry keeps its original snapshot id and data sequence number.
-    pub(crate) fn new_rewrite_manifest_writer(&self) -> Result<ManifestWriter> {
+    ///
+    /// `partition_spec` is the spec the re-emitted entries were written under, and
+    /// `schema` is a table schema compatible with it — one that contains every
+    /// source column the spec references. Both are passed in rather than taken from
+    /// the table's current metadata because a rewrite may repack entries of an
+    /// OLDER spec than the current default, whose source columns may even have been
+    /// dropped from the current schema. Serializing the partition tuples then needs
+    /// the historical schema the entries were written under, not `current_schema()`;
+    /// a rewrite of current-spec entries simply passes the current schema.
+    pub(crate) fn new_rewrite_manifest_writer(
+        &self,
+        schema: SchemaRef,
+        partition_spec: PartitionSpec,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-rewrite-{}.{}",
             self.table.metadata().location(),
@@ -303,12 +317,8 @@ impl<'a> SnapshotProducer<'a> {
             output_file,
             Some(self.snapshot_id),
             self.key_metadata.clone(),
-            self.table.metadata().current_schema().clone(),
-            self.table
-                .metadata()
-                .default_partition_spec()
-                .as_ref()
-                .clone(),
+            schema,
+            partition_spec,
         );
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
@@ -468,10 +478,10 @@ impl<'a> SnapshotProducer<'a> {
         // before a concurrent commit changed the base.
         if let Some(previous) = previous_snapshot {
             for key in &self.inherit_summary_keys {
-                if !additional_properties.contains_key(key) {
-                    if let Some(value) = previous.summary().additional_properties.get(key) {
-                        additional_properties.insert(key.clone(), value.clone());
-                    }
+                if !additional_properties.contains_key(key)
+                    && let Some(value) = previous.summary().additional_properties.get(key)
+                {
+                    additional_properties.insert(key.clone(), value.clone());
                 }
             }
         }
@@ -595,4 +605,77 @@ impl<'a> SnapshotProducer<'a> {
 
         Ok(ActionCommit::new(updates, requirements))
     }
+}
+
+pub(crate) fn collect_manifests_entries(
+    source: &ManifestFile,
+    entries: &[ManifestEntryRef],
+    row_lineage: bool,
+    mut should_emit: impl FnMut(&ManifestEntry) -> bool,
+    out: &mut Vec<ManifestEntry>,
+) -> Result<()> {
+    if !row_lineage {
+        out.extend(
+            entries
+                .iter()
+                .filter(|entry| should_emit(entry))
+                .map(|entry| (**entry).clone()),
+        );
+        return Ok(());
+    }
+
+    // The caller's pre-lineage guard rejects a V3 input without an assigned base,
+    // so this is present; treat its absence as an internal invariant violation.
+    let base = source.first_row_id.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "V3 manifest rewrite reached an input manifest without an assigned first_row_id",
+        )
+    })?;
+
+    let mut offset: u64 = 0;
+    for entry in entries {
+        let data_file = entry.data_file();
+        let target_id = match data_file.first_row_id() {
+            // Already materialized: keep it, and it does not draw from the offset.
+            // Reject a negative on-disk value here — this helper is the single
+            // boundary both rewrite actions materialize through, so a corrupt `-1`
+            // is caught once rather than sign-cast to a huge `u64` base downstream.
+            // Row ids are non-negative by spec; the parser does not enforce it.
+            Some(existing_id) => {
+                if existing_id < 0 {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Negative first_row_id {existing_id} on data file {} during manifest rewrite",
+                            data_file.file_path()
+                        ),
+                    ));
+                }
+                existing_id
+            }
+            None => {
+                let inherited = base.checked_add(offset).and_then(|v| i64::try_from(v).ok());
+                offset = offset.checked_add(data_file.record_count()).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Row count overflow while materializing first_row_id during manifest rewrite",
+                    )
+                })?;
+                inherited.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "first_row_id overflow while materializing row lineage during manifest rewrite",
+                    )
+                })?
+            }
+        };
+        if should_emit(entry) {
+            let mut owned = (**entry).clone();
+            owned.data_file.first_row_id = Some(target_id);
+            out.push(owned);
+        }
+    }
+
+    Ok(())
 }
