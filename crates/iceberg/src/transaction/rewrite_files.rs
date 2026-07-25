@@ -333,6 +333,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     })?;
                     min_row_id = Some(min_row_id.map_or(first_row_id, |min| min.min(first_row_id)));
                 }
+                // TODO(med): add deleted files to manifest entry - writer.add_delete_file
                 writer.add_existing_file(
                     entry.data_file().clone(),
                     snapshot_id,
