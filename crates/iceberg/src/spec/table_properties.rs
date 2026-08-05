@@ -144,6 +144,25 @@ impl TableProperties {
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
+    /// Property key that switches snapshot expiration on for the table.
+    pub const PROPERTY_HISTORY_EXPIRE_ENABLED: &str = "history.expire.enabled";
+    /// Property key for the minimum number of ancestor snapshots to retain.
+    pub const PROPERTY_HISTORY_EXPIRE_MIN_SNAPSHOTS_TO_KEEP: &str =
+        "history.expire.min-snapshots-to-keep";
+    /// Default value for the minimum number of ancestor snapshots to retain,
+    /// as defined by the Iceberg spec.
+    pub const PROPERTY_HISTORY_EXPIRE_MIN_SNAPSHOTS_TO_KEEP_DEFAULT: usize = 1;
+    /// Property key for the maximum age of a retained snapshot, in milliseconds.
+    pub const PROPERTY_HISTORY_EXPIRE_MAX_SNAPSHOT_AGE_MS: &str =
+        "history.expire.max-snapshot-age-ms";
+    /// Default value for the maximum age of a retained snapshot, as defined by the
+    /// Iceberg spec: 5 days.
+    pub const PROPERTY_HISTORY_EXPIRE_MAX_SNAPSHOT_AGE_MS_DEFAULT: i64 = 5 * 24 * 60 * 60 * 1000;
+    /// Property key naming a snapshot-summary key whose most recent carrier — and the
+    /// ancestor chain leading to it — must survive expiration.
+    pub const PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY: &str =
+        "history.expire.preserve-summary-property";
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {

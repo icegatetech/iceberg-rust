@@ -566,6 +566,9 @@ mod tests {
     /// A large target that keeps every seeded manifest in a single output.
     const LARGE_TARGET: u64 = 100 * 1024 * 1024;
 
+    /// Summary key the action requires as its marker property.
+    const MARKER_PROPERTY: &str = "example.manifest-rewrite";
+
     fn data_file(path: &str, rows: u64, spec_id: i32, partition: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -588,7 +591,7 @@ mod tests {
     }
 
     fn marker() -> HashMap<String, String> {
-        HashMap::from([("icegate.manifest-rewrite".to_string(), "true".to_string())])
+        HashMap::from([(MARKER_PROPERTY.to_string(), "true".to_string())])
     }
 
     async fn append_file<C: Catalog>(catalog: &C, table: Table, path: &str) -> Table {
@@ -1260,9 +1263,7 @@ mod tests {
 
         let summary = table.metadata().current_snapshot().unwrap().summary();
         assert_eq!(
-            summary
-                .additional_properties
-                .get("icegate.manifest-rewrite"),
+            summary.additional_properties.get(MARKER_PROPERTY),
             Some(&"true".to_string()),
             "marker property must be present in the new snapshot summary"
         );
