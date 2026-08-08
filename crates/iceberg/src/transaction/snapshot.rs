@@ -333,8 +333,16 @@ impl<'a> SnapshotProducer<'a> {
             DataFileFormat::Avro
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
-        let builder =
-            ManifestWriterBuilder::new(output_file, Some(self.snapshot_id), schema, partition_spec);
+        let builder = if let Some(em) = self.table.encryption_manager() {
+            ManifestWriterBuilder::new_from_encrypted(
+                em.encrypt(output_file),
+                Some(self.snapshot_id),
+                schema,
+                partition_spec,
+            )?
+        } else {
+            ManifestWriterBuilder::new(output_file, Some(self.snapshot_id), schema, partition_spec)
+        };
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),
             FormatVersion::V2 => Ok(builder.build_v2_data()),

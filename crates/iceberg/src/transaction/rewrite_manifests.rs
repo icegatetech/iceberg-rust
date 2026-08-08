@@ -37,7 +37,6 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// snapshot into fewer, larger ones, producing a `replace` snapshot.
 pub struct RewriteManifestsAction {
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     input_manifest_paths: Vec<String>,
     target_manifest_size_bytes: u64,
@@ -56,7 +55,6 @@ impl RewriteManifestsAction {
     pub(crate) fn new() -> Self {
         Self {
             commit_uuid: None,
-            key_metadata: None,
             snapshot_properties: HashMap::default(),
             input_manifest_paths: vec![],
             target_manifest_size_bytes: DEFAULT_TARGET_MANIFEST_SIZE_BYTES,
@@ -85,11 +83,6 @@ impl RewriteManifestsAction {
         self
     }
 
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
-        self
-    }
 
     /// Set snapshot summary properties. At least one property is required: a
     /// manifest rewrite adds no data files, and the snapshot producer rejects a
@@ -144,7 +137,6 @@ impl TransactionAction for RewriteManifestsAction {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             vec![],
         )
@@ -196,8 +188,10 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
             ));
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(snapshot_produce.table.file_io(), metadata)
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         // Pick the named inputs out of the manifest list. Iterating the LIST rather
@@ -604,10 +598,7 @@ mod tests {
 
     async fn manifest_paths(table: &Table) -> Vec<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         manifest_list
             .entries()
             .iter()
@@ -617,10 +608,7 @@ mod tests {
 
     async fn live_file_paths(table: &Table) -> Vec<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let mut paths = Vec::new();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
@@ -636,10 +624,7 @@ mod tests {
 
     async fn data_sequence_number_of(table: &Table, path: &str) -> Option<i64> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             for e in manifest.entries() {
@@ -668,10 +653,7 @@ mod tests {
     /// reorders and repacks the entries.
     async fn effective_first_row_ids(table: &Table) -> HashMap<String, i64> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let mut out = HashMap::new();
         for entry in manifest_list.entries() {
             let base = entry.first_row_id.map(|v| v as i64);
@@ -697,10 +679,7 @@ mod tests {
     /// Whether every live data file carries a non-null on-disk `first_row_id`.
     async fn all_live_first_row_ids_materialized(table: &Table) -> bool {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             for e in manifest.entries() {
@@ -1665,10 +1644,7 @@ mod tests {
 
         // One merged output manifest, still under the historical spec 0.
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         assert_eq!(manifest_list.entries().len(), 1);
         assert_eq!(manifest_list.entries()[0].partition_spec_id, 0);
 
@@ -1704,10 +1680,7 @@ mod tests {
     /// entry is re-emitted under is dropped exactly as a reader would drop it.
     async fn live_lower_bounds(table: &Table) -> HashMap<String, HashMap<i32, Datum>> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let mut out = HashMap::new();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
@@ -1895,7 +1868,7 @@ mod tests {
 
     /// The manifest-list entry of the manifest holding `file_path`, so a test can
     /// name a manifest by its content instead of by its generated object path.
-    async fn manifest_holding(table: &Table, file_path: &str) -> crate::spec::ManifestFile {
+    async fn manifest_holding(table: &Table, file_path: &str) -> ManifestFile {
         for entry in manifest_files(table).await {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             if manifest
@@ -1910,18 +1883,15 @@ mod tests {
     }
 
     /// Every manifest file in the current snapshot, cloned from the manifest list.
-    async fn manifest_files(table: &Table) -> Vec<crate::spec::ManifestFile> {
+    async fn manifest_files(table: &Table) -> Vec<ManifestFile> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         manifest_list.entries().to_vec()
     }
 
     /// The decoded `(lower, upper)` Long partition-summary bounds of a manifest's
     /// single partition field — the narrow range a manifest-list pruner reads.
-    fn summary_bounds_long(manifest: &crate::spec::ManifestFile) -> (i64, i64) {
+    fn summary_bounds_long(manifest: &ManifestFile) -> (i64, i64) {
         use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
         let summary = &manifest.partitions.as_ref().unwrap()[0];
         let decode = |bytes: &serde_bytes::ByteBuf| -> i64 {
@@ -1943,7 +1913,7 @@ mod tests {
     /// `manifests` and return the number and total manifest bytes that survive —
     /// i.e. the manifests a scan with this partition filter would still open.
     fn pruned(
-        manifests: &[crate::spec::ManifestFile],
+        manifests: &[ManifestFile],
         filter: &crate::expr::BoundPredicate,
     ) -> (usize, u64) {
         use crate::expr::visitors::manifest_evaluator::ManifestEvaluator;
@@ -2186,10 +2156,7 @@ mod tests {
     /// so a corrupt negative value seeded for a test is observable.
     async fn first_row_id_on_disk(table: &Table, path: &str) -> Option<i64> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             for e in manifest.entries() {
@@ -2222,6 +2189,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::stream::BoxStream;
     use serde::{Deserialize, Serialize};
 
     use crate::Result;
@@ -2292,6 +2260,10 @@ mod tests {
 
         async fn delete_prefix(&self, path: &str) -> Result<()> {
             self.inner.delete_prefix(path).await
+        }
+
+        async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
+            self.inner.delete_stream(paths).await
         }
 
         fn new_input(&self, path: &str) -> Result<InputFile> {
@@ -2548,21 +2520,21 @@ mod tests {
     }
 
     impl SnapshotProduceOperation for SeedManifestsOperation {
-        fn operation(&self) -> crate::spec::Operation {
+        fn operation(&self) -> Operation {
             Operation::Replace
         }
 
         async fn delete_entries(
             &self,
             _snapshot_produce: &SnapshotProducer<'_>,
-        ) -> crate::Result<Vec<crate::spec::ManifestEntry>> {
+        ) -> Result<Vec<crate::spec::ManifestEntry>> {
             Ok(vec![])
         }
 
         async fn existing_manifest(
             &self,
             _snapshot_produce: &SnapshotProducer<'_>,
-        ) -> crate::Result<Vec<ManifestFile>> {
+        ) -> Result<Vec<ManifestFile>> {
             Ok(self.manifests.clone())
         }
     }
@@ -2578,7 +2550,7 @@ mod tests {
         manifests.extend(extra);
 
         let mut action_commit =
-            SnapshotProducer::new(&table, uuid::Uuid::now_v7(), None, marker(), vec![])
+            SnapshotProducer::new(&table, uuid::Uuid::now_v7(), marker(), vec![])
                 .commit(SeedManifestsOperation { manifests }, DefaultManifestProcess)
                 .await
                 .unwrap();
@@ -2591,7 +2563,6 @@ mod tests {
         let builder = ManifestWriterBuilder::new(
             table.file_io().new_output(path).unwrap(),
             Some(table.metadata().current_snapshot_id().unwrap_or(1)),
-            None,
             table.metadata().current_schema().clone(),
             table.metadata().default_partition_spec().as_ref().clone(),
         );
@@ -2994,7 +2965,7 @@ mod tests {
         async fn list_namespaces(
             &self,
             parent: Option<&NamespaceIdent>,
-        ) -> crate::Result<Vec<NamespaceIdent>> {
+        ) -> Result<Vec<NamespaceIdent>> {
             self.inner.list_namespaces(parent).await
         }
 
@@ -3002,15 +2973,15 @@ mod tests {
             &self,
             namespace: &NamespaceIdent,
             properties: HashMap<String, String>,
-        ) -> crate::Result<Namespace> {
+        ) -> Result<Namespace> {
             self.inner.create_namespace(namespace, properties).await
         }
 
-        async fn get_namespace(&self, namespace: &NamespaceIdent) -> crate::Result<Namespace> {
+        async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
             self.inner.get_namespace(namespace).await
         }
 
-        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> crate::Result<bool> {
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
             self.inner.namespace_exists(namespace).await
         }
 
@@ -3018,15 +2989,15 @@ mod tests {
             &self,
             namespace: &NamespaceIdent,
             properties: HashMap<String, String>,
-        ) -> crate::Result<()> {
+        ) -> Result<()> {
             self.inner.update_namespace(namespace, properties).await
         }
 
-        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> crate::Result<()> {
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
             self.inner.drop_namespace(namespace).await
         }
 
-        async fn list_tables(&self, namespace: &NamespaceIdent) -> crate::Result<Vec<TableIdent>> {
+        async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
             self.inner.list_tables(namespace).await
         }
 
@@ -3034,23 +3005,27 @@ mod tests {
             &self,
             namespace: &NamespaceIdent,
             creation: TableCreation,
-        ) -> crate::Result<Table> {
+        ) -> Result<Table> {
             self.inner.create_table(namespace, creation).await
         }
 
-        async fn load_table(&self, table: &TableIdent) -> crate::Result<Table> {
+        async fn load_table(&self, table: &TableIdent) -> Result<Table> {
             self.inner.load_table(table).await
         }
 
-        async fn drop_table(&self, table: &TableIdent) -> crate::Result<()> {
+        async fn drop_table(&self, table: &TableIdent) -> Result<()> {
             self.inner.drop_table(table).await
         }
 
-        async fn table_exists(&self, table: &TableIdent) -> crate::Result<bool> {
+        async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+            self.inner.purge_table(table).await
+        }
+
+        async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
             self.inner.table_exists(table).await
         }
 
-        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> crate::Result<()> {
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
             self.inner.rename_table(src, dest).await
         }
 
@@ -3058,11 +3033,11 @@ mod tests {
             &self,
             table: &TableIdent,
             metadata_location: String,
-        ) -> crate::Result<Table> {
+        ) -> Result<Table> {
             self.inner.register_table(table, metadata_location).await
         }
 
-        async fn update_table(&self, commit: TableCommit) -> crate::Result<Table> {
+        async fn update_table(&self, commit: TableCommit) -> Result<Table> {
             if let Some(interference) = self.pending.lock().await.take() {
                 let table = self.inner.load_table(commit.identifier()).await?;
                 let tx = Transaction::new(&table);

@@ -46,7 +46,6 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// commit causes a retryable conflict rather than a lost update.
 pub struct RewriteFilesAction {
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
@@ -59,7 +58,6 @@ impl RewriteFilesAction {
     pub(crate) fn new() -> Self {
         Self {
             commit_uuid: None,
-            key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             removed_data_files: vec![],
@@ -84,12 +82,6 @@ impl RewriteFilesAction {
     /// Set commit UUID for the snapshot.
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
-        self
-    }
-
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
         self
     }
 
@@ -167,7 +159,6 @@ impl TransactionAction for RewriteFilesAction {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
         )
@@ -226,11 +217,10 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             ));
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let removed_file_paths: HashSet<String> = self
@@ -398,10 +388,7 @@ mod tests {
 
     async fn live_file_paths(table: &crate::table::Table) -> Vec<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let mut paths = Vec::new();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
@@ -440,8 +427,9 @@ mod tests {
 
         // Record the survivor (b)'s data sequence number before the rewrite.
         let base_snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = base_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(base_snapshot)
+            .load()
             .await
             .unwrap();
         let mut survivor_seq_before = None;
@@ -499,10 +487,7 @@ mod tests {
 
         let mut survivor_seq_after = None;
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             for e in manifest.entries() {
@@ -519,10 +504,7 @@ mod tests {
 
     async fn first_row_id_of(table: &crate::table::Table, path: &str) -> Option<i64> {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         for entry in manifest_list.entries() {
             let manifest = entry.load_manifest(table.file_io()).await.unwrap();
             for e in manifest.entries() {
