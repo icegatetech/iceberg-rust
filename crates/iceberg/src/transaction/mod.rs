@@ -385,8 +385,29 @@ mod tests {
         let reader = BufReader::new(file);
         let base_metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
 
+        // A non-null `initial-default`/`write-default` is a V3-only feature, and the
+        // shared fixture's `x` carries one. Strip them when seeding a V1/V2 table so
+        // the schema stays legal for the requested format version while keeping the
+        // field ids and types the shared `file()`/`data_file()` builders rely on.
+        let base_schema = base_metadata.current_schema();
+        let schema = if format_version == crate::spec::FormatVersion::V3 {
+            (**base_schema).clone()
+        } else {
+            let fields = base_schema.as_struct().fields().iter().map(|field| {
+                let mut field = (**field).clone();
+                field.initial_default = None;
+                field.write_default = None;
+                Arc::new(field)
+            });
+            crate::spec::Schema::builder()
+                .with_schema_id(base_schema.schema_id())
+                .with_fields(fields)
+                .build()
+                .unwrap()
+        };
+
         let table_creation = TableCreation::builder()
-            .schema((**base_metadata.current_schema()).clone())
+            .schema(schema)
             .partition_spec((**base_metadata.default_partition_spec()).clone())
             .sort_order((**base_metadata.default_sort_order()).clone())
             .name(table_ident.name().to_string())

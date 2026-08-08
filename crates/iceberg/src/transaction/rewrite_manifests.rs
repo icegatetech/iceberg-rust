@@ -83,7 +83,6 @@ impl RewriteManifestsAction {
         self
     }
 
-
     /// Set snapshot summary properties. At least one property is required: a
     /// manifest rewrite adds no data files, and the snapshot producer rejects a
     /// commit that has neither added files nor properties, so callers pass a
@@ -1912,10 +1911,7 @@ mod tests {
     /// Run manifest-list-level pruning (the real [`ManifestEvaluator`]) over
     /// `manifests` and return the number and total manifest bytes that survive —
     /// i.e. the manifests a scan with this partition filter would still open.
-    fn pruned(
-        manifests: &[ManifestFile],
-        filter: &crate::expr::BoundPredicate,
-    ) -> (usize, u64) {
+    fn pruned(manifests: &[ManifestFile], filter: &crate::expr::BoundPredicate) -> (usize, u64) {
         use crate::expr::visitors::manifest_evaluator::ManifestEvaluator;
         let evaluator = ManifestEvaluator::builder(filter.clone()).build();
         let mut count = 0usize;
@@ -2341,6 +2337,7 @@ mod tests {
             .metadata_location("s3://bucket/test/location/metadata/v3.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(file_io)
+            .runtime(crate::test_utils::test_runtime())
             .build()
             .unwrap()
     }

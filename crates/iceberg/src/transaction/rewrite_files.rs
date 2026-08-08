@@ -502,6 +502,31 @@ mod tests {
         );
     }
 
+    /// The `first_row_id` physically stored for `path`, read straight from the
+    /// manifest bytes. Unlike [`first_row_id_of`], this bypasses the row-lineage
+    /// inheritance that `ManifestFile::load_manifest` applies on read, so it can
+    /// tell an id that was written out from one that was only inherited.
+    async fn first_row_id_on_disk(table: &crate::table::Table, path: &str) -> Option<i64> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        for manifest in manifest_list.entries() {
+            let bytes = table
+                .file_io()
+                .new_input(&manifest.manifest_path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let (_, entries) = crate::spec::Manifest::try_from_avro_bytes(&bytes).unwrap();
+            for e in entries {
+                if e.file_path() == path {
+                    return e.data_file().first_row_id();
+                }
+            }
+        }
+        None
+    }
+
     async fn first_row_id_of(table: &crate::table::Table, path: &str) -> Option<i64> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
@@ -540,7 +565,10 @@ mod tests {
                 .await
                 .unwrap()
         };
-        assert_eq!(first_row_id_of(&table, "b.parquet").await, None); // null on disk
+        // Newly added files are written with a null `first_row_id` and inherit it
+        // from the manifest, which is what makes the rewrite below interesting.
+        assert_eq!(first_row_id_on_disk(&table, "b.parquet").await, None);
+        assert_eq!(first_row_id_of(&table, "b.parquet").await, Some(2)); // inherited
         let next_row_id_before = table.metadata().next_row_id();
         assert_eq!(next_row_id_before, 6);
 
