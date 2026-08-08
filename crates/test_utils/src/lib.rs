@@ -72,9 +72,14 @@ mod common {
 
     /// Returns the Glue (Moto mock) endpoint.
     /// Checks ICEBERG_TEST_GLUE_ENDPOINT env var, otherwise returns localhost default.
+    ///
+    /// Uses the `127.0.0.1` literal rather than the `localhost` name: `moto_server`
+    /// binds IPv4-only, so on hosts where `localhost` resolves to `::1` first the
+    /// connection is accepted by the container runtime's port forwarder and then
+    /// reset, surfacing as an opaque AWS SDK `DispatchFailure`.
     pub fn get_glue_endpoint() -> String {
         std::env::var(ENV_GLUE_ENDPOINT)
-            .unwrap_or_else(|_| format!("http://localhost:{DEFAULT_GLUE_PORT}"))
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{DEFAULT_GLUE_PORT}"))
     }
 
     /// Returns the GCS (fake-gcs-server) endpoint.
