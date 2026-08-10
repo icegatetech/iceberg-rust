@@ -23,7 +23,9 @@ use crate::compression::CompressionCodec;
 use crate::error::{Error, ErrorKind, Result};
 use crate::util::location::strip_trailing_slash;
 
-fn parse_property<T: FromStr>(
+/// Parse a property, falling back to `default` when the key is absent and failing
+/// when the value is present but unparsable.
+pub(crate) fn parse_property<T: FromStr>(
     properties: &HashMap<String, String>,
     key: &str,
     default: T,
@@ -175,7 +177,7 @@ fn parse_parquet_compression(properties: &HashMap<String, String>) -> Result<Com
 /// Parse boolean property case insensitively
 /// Rust standard library only accepts "true" and "false", see https://doc.rust-lang.org/std/primitive.bool.html#method.from_str
 /// Users might accidentally trigger fallback with valid configuration values such as "False" or "True"
-fn parse_property_bool(
+pub(crate) fn parse_property_bool(
     properties: &HashMap<String, String>,
     key: &str,
     default: bool,
@@ -455,6 +457,25 @@ impl TableProperties {
         "write.object-storage.partitioned-paths";
     /// Default value for [PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS]
     pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT: bool = true;
+
+    // ------------------------------------------------------------------
+    // Not part of the Iceberg table-properties spec; kept
+    // in one clearly-owned block so upstream merges never interleave with
+    // these lines.
+    // ------------------------------------------------------------------
+
+    /// Property key that switches automatic snapshot expiration on for the table.
+    ///
+    /// Fork extension, not part of the Iceberg spec: upstream expires snapshots
+    /// only through the explicit `Transaction::expire_snapshots` action, while
+    /// this fork also expires on every commit once the table opts in.
+    pub const PROPERTY_HISTORY_EXPIRE_ENABLED: &str = "history.expire.enabled";
+    /// Property key naming a snapshot-summary key whose most recent carrier — and
+    /// the ancestor chain leading to it — must survive automatic expiration.
+    ///
+    /// Fork extension, not part of the Iceberg spec.
+    pub const PROPERTY_HISTORY_EXPIRE_PRESERVE_SUMMARY_PROPERTY: &str =
+        "history.expire.preserve-summary-property";
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {

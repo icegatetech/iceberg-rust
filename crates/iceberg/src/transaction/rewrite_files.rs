@@ -638,7 +638,7 @@ mod tests {
     /// materialize `_row_id` / `_last_updated_sequence_number` in its outputs
     /// cannot silently reassign row identity through this action.
     #[tokio::test]
-    async fn rewrite_files_rejects_v3_without_row_lineage_optin() {
+    async fn rewrite_files_rejects_v3_without_row_lineage_option() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
