@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod auto_expire_snapshots;
 mod expire_snapshots;
 mod rewrite_files;
 mod rewrite_manifests;
@@ -262,6 +263,18 @@ impl Transaction {
             )?;
         }
 
+        // After the loop above, because the plan is computed against `current_table`:
+        // every action of this commit is applied to it, so the snapshot this commit
+        // adds counts towards the retention window and roots the ancestor chain the
+        // window is measured along. Last in the list as a contract for a catalog that
+        // applies the updates in sequence and is free to validate each one more
+        // strictly than this crate does — an earlier `SetSnapshotRef` naming an id a
+        // later `RemoveSnapshots` takes away is nothing the writer side would catch.
+        // Nothing here depends on that order today: every reference target is
+        // unconditionally protected from expiration, so no update of this commit can
+        // name a snapshot another one removed.
+        existing_updates.extend(auto_expire_snapshots::expiration_updates(&current_table)?);
+
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
@@ -352,7 +365,7 @@ mod tests {
     }
 
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
-        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V3).await
+        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V3, HashMap::new()).await
     }
 
     /// Create a V2 minimal table in `catalog`, reusing the version-independent
@@ -360,12 +373,21 @@ mod tests {
     /// test builders (spec 0, identity `x`) stay compatible. Used to exercise the
     /// V1/V2 (no row lineage) paths and the V2→V3 upgrade carry-over.
     pub(crate) async fn make_v2_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
-        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V2).await
+        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V2, HashMap::new()).await
+    }
+
+    /// As [`make_v2_minimal_table_in_catalog`], but the table carries `properties`.
+    pub(crate) async fn make_v2_minimal_table_in_catalog_with_properties(
+        catalog: &impl Catalog,
+        properties: HashMap<String, String>,
+    ) -> Table {
+        make_minimal_table_in_catalog(catalog, crate::spec::FormatVersion::V2, properties).await
     }
 
     async fn make_minimal_table_in_catalog(
         catalog: &impl Catalog,
         format_version: crate::spec::FormatVersion,
+        properties: HashMap<String, String>,
     ) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
@@ -412,6 +434,7 @@ mod tests {
             .sort_order((**base_metadata.default_sort_order()).clone())
             .name(table_ident.name().to_string())
             .format_version(format_version)
+            .properties(properties)
             .build();
 
         catalog

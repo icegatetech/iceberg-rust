@@ -486,6 +486,10 @@ impl TableMetadataBuilder {
     /// Keeps as changes only the snapshots that were actually removed.
     pub fn remove_snapshots(mut self, snapshot_ids: &[i64]) -> Self {
         let mut removed_snapshots = Vec::with_capacity(snapshot_ids.len());
+        // Membership, not a scan: a retention batch is thousands of ids wide and is
+        // matched against every snapshot the table holds, on the writer side and
+        // again on the catalog side.
+        let snapshot_ids: HashSet<i64> = snapshot_ids.iter().copied().collect();
 
         self.metadata.snapshots.retain(|k, _| {
             if snapshot_ids.contains(k) {
