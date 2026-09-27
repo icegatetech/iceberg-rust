@@ -37,7 +37,7 @@ mod scan_metrics;
 mod value;
 
 pub use reader::*;
-pub use scan_metrics::{ScanMetrics, ScanResult};
+pub use scan_metrics::{BloomFilterMetrics, ScanMetrics, ScanResult};
 pub use value::*;
 /// Partition value calculator for computing partition values
 pub mod partition_value_calculator;

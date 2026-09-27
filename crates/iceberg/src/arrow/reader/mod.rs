@@ -34,6 +34,7 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
+mod bloom_filter_prefetch;
 mod file_reader;
 mod options;
 mod pipeline;
@@ -107,9 +108,10 @@ impl ArrowReaderBuilder {
     /// checked. Row groups where the bloom filter proves the value is absent
     /// are skipped entirely.
     ///
-    /// Defaults to disabled. Each bloom filter is a separate read, and they are
-    /// issued serially — one round trip per relevant column per row group, before
-    /// any data is read. TODO(#3191)
+    /// Defaults to disabled. The bloom filters of the candidate row groups are
+    /// prefetched in parallel before any data is read: only byte-adjacent bloom
+    /// filters are merged into one request, and up to `range_fetch_concurrency`
+    /// requests run at the same time.
     pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
         self.bloom_filter_enabled = bloom_filter_enabled;
         self

@@ -217,8 +217,8 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, Decimal128Array, Float32Array, Int32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray,
+        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -1323,7 +1323,7 @@ mod tests {
         if with_bloom_filters {
             props = props
                 .set_bloom_filter_enabled(true)
-                .set_bloom_filter_max_ndv(ROWS_PER_GROUP as u64);
+                .set_bloom_filter_ndv(ROWS_PER_GROUP as u64);
         }
 
         let file = File::create(path).unwrap();
@@ -1361,8 +1361,7 @@ mod tests {
             .with_project_field_ids(project_field_ids)
             .with_predicate(Some(predicate.bind(schema, true).unwrap()))
             .with_case_sensitive(false)
-            .build()
-            .unwrap();
+            .build();
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
         let result = reader.read(tasks).unwrap();
@@ -1761,5 +1760,158 @@ mod tests {
         )
         .await;
         assert_eq!(rows(&on), 1);
+    }
+
+    /// `Fixed` literals are probed with their raw bytes, as the writer inserts
+    /// `FIXED_LEN_BYTE_ARRAY` values.
+    #[tokio::test]
+    async fn test_bloom_pushdown_fixed_len_byte_array() {
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/fixed16.parquet", tmp.path().to_str().unwrap());
+        let fixed16 = |value: i32| u128::try_from(value).unwrap().to_be_bytes();
+        write_value_fixture(
+            &path,
+            DataType::FixedSizeBinary(16),
+            |g| {
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        (0..ROWS_PER_GROUP).map(|i| fixed16(interleaved(g, i))),
+                    )
+                    .unwrap(),
+                )
+            },
+            true,
+        );
+
+        assert_prunes_and_agrees(
+            "fixed16",
+            &path,
+            value_schema(Type::Primitive(PrimitiveType::Fixed(16))),
+            Datum::fixed(fixed16(PRESENT_INT)),
+            Datum::fixed(fixed16(ABSENT_INT)),
+        )
+        .await;
+    }
+
+    /// The bloom filter phase must narrow the row groups before the page index
+    /// row selection is built from them. A row selection built for more row groups
+    /// than are read hands the rows of a pruned row group to a surviving one.
+    #[tokio::test]
+    async fn test_bloom_pushdown_with_row_selection() {
+        const ROWS: i32 = 100;
+        const PAGE_ROWS: usize = 10;
+        const VALUE: i32 = 55;
+
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/row_selection.parquet", tmp.path().to_str().unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "v",
+            DataType::Int32,
+            1,
+        )]));
+        // Row groups 0 and 2 skip 50..=59: their min/max covers VALUE, but neither
+        // their bloom filter nor their page index does. Row group 1 holds VALUE.
+        let without_value: Vec<i32> = (0..50).chain(60..110).collect();
+        let row_groups = [without_value.clone(), (0..ROWS).collect(), without_value];
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_bloom_filter_enabled(true)
+            .set_bloom_filter_ndv(ROWS as u64)
+            .set_bloom_filter_fpp(0.001)
+            // Row selection needs page-level min/max in the column index.
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_data_page_row_count_limit(PAGE_ROWS)
+            // The page row limit is checked once per write batch, 1024 rows by default.
+            .set_write_batch_size(PAGE_ROWS)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        for values in row_groups {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from(values),
+            )])
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+
+        // Precondition: without page-level indexes the row selection is empty or
+        // covers whole row groups, and a misplaced selection would go unnoticed.
+        {
+            use parquet::file::page_index::column_index::ColumnIndexMetaData;
+            use parquet::file::reader::{FileReader, SerializedFileReader};
+            use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+            let metadata = SerializedFileReader::new_with_options(
+                File::open(&path).unwrap(),
+                ReadOptionsBuilder::new().with_page_index().build(),
+            )
+            .unwrap()
+            .metadata()
+            .clone();
+            let column_index = metadata
+                .column_index()
+                .expect("column index must be written");
+            let offset_index = metadata
+                .offset_index()
+                .expect("offset index must be written");
+            for row_group in 0..metadata.num_row_groups() {
+                assert!(matches!(
+                    column_index[row_group][0],
+                    ColumnIndexMetaData::INT32(_)
+                ));
+                assert_eq!(
+                    offset_index[row_group][0].page_locations().len(),
+                    ROWS as usize / PAGE_ROWS
+                );
+            }
+        }
+
+        let schema = value_schema(Type::Primitive(PrimitiveType::Int));
+        let read = |bloom_filter_enabled: bool| {
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(path.clone())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1])
+                .with_predicate(Some(
+                    Reference::new("v")
+                        .equal_to(Datum::int(VALUE))
+                        .bind(schema.clone(), true)
+                        .unwrap(),
+                ))
+                .with_case_sensitive(false)
+                .build();
+            let result = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_row_selection_enabled(true)
+                .with_bloom_filter_enabled(bloom_filter_enabled)
+                .build()
+                .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+                .unwrap();
+            let metrics = result.metrics().bloom_filter().clone();
+            async move {
+                let batches: Vec<RecordBatch> = result.stream().try_collect().await.unwrap();
+                (collapse(&batches), metrics)
+            }
+        };
+
+        let (off, _) = read(false).await;
+        let (on, metrics) = read(true).await;
+
+        // Precondition: without pruning row group 0 the misplaced selection would
+        // go unnoticed.
+        assert_eq!(
+            (metrics.row_groups_pruned(), metrics.row_groups_matched()),
+            (2, 1)
+        );
+        assert_eq!(rows(&off), 1);
+        assert_eq!(
+            on, off,
+            "bloom filter pushdown with row selection changed the rows returned"
+        );
     }
 }

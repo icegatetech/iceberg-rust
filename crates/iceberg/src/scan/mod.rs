@@ -3620,4 +3620,19 @@ pub mod tests {
             .collect();
         assert_eq!(y, (1100..1200).collect::<Vec<i64>>());
     }
+
+    #[tokio::test]
+    async fn test_table_scan_bloom_filter_disabled_by_default() {
+        let table = TableTestFixture::new().table;
+
+        let table_scan = table.scan().build().unwrap();
+        assert!(!table_scan.bloom_filter_enabled);
+
+        let table_scan = table
+            .scan()
+            .with_bloom_filter_enabled(true)
+            .build()
+            .unwrap();
+        assert!(table_scan.bloom_filter_enabled);
+    }
 }

@@ -79,6 +79,17 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_fetch_concurrency(self, range_fetch_concurrency: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
+pub struct iceberg::arrow::BloomFilterMetrics
+impl iceberg::arrow::BloomFilterMetrics
+pub fn iceberg::arrow::BloomFilterMetrics::read_errors(&self) -> u64
+pub fn iceberg::arrow::BloomFilterMetrics::row_groups_matched(&self) -> u64
+pub fn iceberg::arrow::BloomFilterMetrics::row_groups_pruned(&self) -> u64
+impl core::clone::Clone for iceberg::arrow::BloomFilterMetrics
+pub fn iceberg::arrow::BloomFilterMetrics::clone(&self) -> iceberg::arrow::BloomFilterMetrics
+impl core::default::Default for iceberg::arrow::BloomFilterMetrics
+pub fn iceberg::arrow::BloomFilterMetrics::default() -> iceberg::arrow::BloomFilterMetrics
+impl core::fmt::Debug for iceberg::arrow::BloomFilterMetrics
+pub fn iceberg::arrow::BloomFilterMetrics::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
@@ -95,6 +106,7 @@ pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_computed_value
 pub fn iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_precomputed_values(iceberg_schema: iceberg::spec::SchemaRef, partition_spec: iceberg::spec::PartitionSpecRef) -> iceberg::Result<Self>
 pub struct iceberg::arrow::ScanMetrics
 impl iceberg::scan::ScanMetrics
+pub fn iceberg::scan::ScanMetrics::bloom_filter(&self) -> &iceberg::arrow::BloomFilterMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics
@@ -1331,6 +1343,7 @@ impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTaskDelete
 pub fn iceberg::scan::FileScanTaskDeleteFile::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::ScanMetrics
 impl iceberg::scan::ScanMetrics
+pub fn iceberg::scan::ScanMetrics::bloom_filter(&self) -> &iceberg::arrow::BloomFilterMetrics
 pub fn iceberg::scan::ScanMetrics::bytes_read(&self) -> u64
 impl core::clone::Clone for iceberg::scan::ScanMetrics
 pub fn iceberg::scan::ScanMetrics::clone(&self) -> iceberg::scan::ScanMetrics

@@ -513,13 +513,14 @@ impl BoundPredicateVisitor for BloomFilterEvaluator<'_> {
 mod tests {
     use std::collections::HashMap;
     use std::ops::Not;
+    use std::sync::Arc;
 
     use parquet::basic::Type as PhysicalType;
     use parquet::bloom_filter::Sbbf;
     use parquet::data_type::ByteArray;
 
     use super::{BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids};
-    use crate::expr::{Bind, BoundPredicate, Reference};
+    use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
     use crate::spec::decimal_utils::decimal_to_fixed_length_bytes_exact;
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
 
@@ -1611,5 +1612,155 @@ mod tests {
 
         let result = BloomFilterEvaluator::eval(&predicate, &bloom_filters).unwrap();
         assert!(result, "non-representable double must not prune");
+    }
+
+    /// A column without a bloom filter next to one that has a filter must only
+    /// make its own operand might-match; an empty filter set exits before this.
+    #[test]
+    fn test_column_without_bloom_filter_might_match() {
+        let schema = Arc::new(create_test_schema());
+        let bloom_filters = HashMap::from([(
+            1,
+            ColumnBloomFilter::new(
+                create_bloom_filter_with_values_i32(&[1, 2, 3]),
+                PhysicalType::INT32,
+                0,
+            ),
+        )]);
+        let eval = |predicate: Predicate| {
+            let predicate = predicate.bind(schema.clone(), true).unwrap();
+            BloomFilterEvaluator::eval(&predicate, &bloom_filters).unwrap()
+        };
+
+        assert!(
+            eval(
+                Reference::new("id")
+                    .equal_to(Datum::int(2))
+                    .and(Reference::new("name").equal_to(Datum::string("zzz")))
+            ),
+            "eq on a column without a bloom filter must might-match"
+        );
+        // Two literals: `bind` rewrites a single-literal IN into eq.
+        assert!(
+            eval(
+                Reference::new("id").equal_to(Datum::int(2)).and(
+                    Reference::new("name").is_in([Datum::string("yyy"), Datum::string("zzz")])
+                )
+            ),
+            "IN on a column without a bloom filter must might-match"
+        );
+        assert!(
+            !eval(
+                Reference::new("id")
+                    .equal_to(Datum::int(999))
+                    .and(Reference::new("name").equal_to(Datum::string("zzz")))
+            ),
+            "the column with a bloom filter must still prune"
+        );
+    }
+
+    #[test]
+    fn test_or_all_absent() {
+        let schema = create_test_schema();
+        let bloom_filters = HashMap::from([(
+            1,
+            ColumnBloomFilter::new(
+                create_bloom_filter_with_values_i32(&[1, 2, 3]),
+                PhysicalType::INT32,
+                0,
+            ),
+        )]);
+
+        let predicate = Reference::new("id")
+            .equal_to(Datum::int(998))
+            .or(Reference::new("id").equal_to(Datum::int(999)))
+            .bind(schema.into(), true)
+            .unwrap();
+
+        let result = BloomFilterEvaluator::eval(&predicate, &bloom_filters).unwrap();
+        assert!(
+            !result,
+            "OR should be false when both operands are definitely absent"
+        );
+    }
+
+    #[test]
+    fn test_collects_field_ids_under_or() {
+        let schema = create_test_schema();
+        let predicate = Reference::new("id")
+            .equal_to(Datum::int(1))
+            .or(Reference::new("name").equal_to(Datum::string("alice")))
+            .bind(schema.into(), true)
+            .unwrap();
+
+        assert_eq!(collected_ids(predicate), vec![1, 2]);
+    }
+
+    /// Every operator other than `eq` and `in` cannot be probed and must
+    /// might-match, even when its column has a bloom filter.
+    #[test]
+    fn test_unprobeable_operators_always_might_match() {
+        // `name` is optional: `bind` folds IS [NOT] NULL on a required field into a
+        // constant. `score` is a double: `bind` rejects IS [NOT] NAN on other types.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "score", Type::Primitive(PrimitiveType::Double))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // Non-empty, otherwise `eval` returns before visiting any operator.
+        let bloom_filters = HashMap::from([(
+            1,
+            ColumnBloomFilter::new(
+                create_bloom_filter_with_values_i32(&[1, 2, 3]),
+                PhysicalType::INT32,
+                0,
+            ),
+        )]);
+
+        let cases = [
+            (
+                "less_than_or_eq",
+                Reference::new("id").less_than_or_equal_to(Datum::int(0)),
+            ),
+            (
+                "greater_than",
+                Reference::new("id").greater_than(Datum::int(100)),
+            ),
+            (
+                "greater_than_or_eq",
+                Reference::new("id").greater_than_or_equal_to(Datum::int(100)),
+            ),
+            ("not_eq", Reference::new("id").not_equal_to(Datum::int(2))),
+            // Two literals: `bind` rewrites a single-literal NOT IN into not_eq.
+            (
+                "not_in",
+                Reference::new("id").is_not_in([Datum::int(1), Datum::int(2)]),
+            ),
+            ("is_null", Reference::new("name").is_null()),
+            ("not_null", Reference::new("name").is_not_null()),
+            (
+                "starts_with",
+                Reference::new("name").starts_with(Datum::string("a")),
+            ),
+            (
+                "not_starts_with",
+                Reference::new("name").not_starts_with(Datum::string("a")),
+            ),
+            ("is_nan", Reference::new("score").is_nan()),
+            ("not_nan", Reference::new("score").is_not_nan()),
+        ];
+
+        for (operator, predicate) in cases {
+            let predicate = predicate.bind(schema.clone(), true).unwrap();
+            let result = BloomFilterEvaluator::eval(&predicate, &bloom_filters).unwrap();
+            assert!(result, "{operator} should always return might-match");
+        }
     }
 }

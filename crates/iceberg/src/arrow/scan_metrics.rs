@@ -53,12 +53,14 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    bloom_filter: BloomFilterMetrics,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            bloom_filter: BloomFilterMetrics::default(),
         }
     }
 
@@ -69,6 +71,11 @@ impl ScanMetrics {
     /// Total bytes read from storage during this scan, including data files and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Row group counters of the bloom filter phase.
+    pub fn bloom_filter(&self) -> &BloomFilterMetrics {
+        &self.bloom_filter
     }
 }
 
@@ -92,5 +99,53 @@ impl ScanResult {
     /// Returns a reference to the scan metrics.
     pub fn metrics(&self) -> &ScanMetrics {
         &self.metrics
+    }
+}
+
+/// Row group counters of the bloom filter phase of one scan.
+///
+/// Every row group that reaches the bloom filter phase is counted exactly
+/// once, as pruned or as matched. Clones share the counters.
+#[derive(Clone, Debug, Default)]
+pub struct BloomFilterMetrics {
+    row_groups_pruned: Arc<AtomicU64>,
+    row_groups_matched: Arc<AtomicU64>,
+    read_errors: Arc<AtomicU64>,
+}
+
+impl BloomFilterMetrics {
+    /// Row groups the bloom filter phase proved to have no matching rows.
+    pub fn row_groups_pruned(&self) -> u64 {
+        self.row_groups_pruned.load(Ordering::Relaxed)
+    }
+
+    /// Row groups that entered the bloom filter phase and were kept, including
+    /// row groups for which no bloom filter was read.
+    pub fn row_groups_matched(&self) -> u64 {
+        self.row_groups_matched.load(Ordering::Relaxed)
+    }
+
+    /// Bloom filters that could not be fetched or parsed. Their columns are
+    /// treated as might-match. Counted for bloom filters whose column chunk
+    /// records `bloom_filter_length`; a failure to read any other bloom filter
+    /// is only logged at debug level.
+    pub fn read_errors(&self) -> u64 {
+        self.read_errors.load(Ordering::Relaxed)
+    }
+
+    /// Records the outcome of the bloom filter phase for one data file:
+    /// `candidates` row groups entered the phase and `survivors` of them were kept.
+    pub(crate) fn record_row_groups(&self, candidates: usize, survivors: usize) {
+        debug_assert!(survivors <= candidates);
+        let pruned = candidates.saturating_sub(survivors);
+        self.row_groups_pruned
+            .fetch_add(pruned as u64, Ordering::Relaxed);
+        self.row_groups_matched
+            .fetch_add(survivors as u64, Ordering::Relaxed);
+    }
+
+    /// Records `count` bloom filters that could not be fetched or parsed.
+    pub(crate) fn add_read_errors(&self, count: u64) {
+        self.read_errors.fetch_add(count, Ordering::Relaxed);
     }
 }

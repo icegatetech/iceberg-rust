@@ -138,6 +138,15 @@ impl FileScanTaskReader {
         )
         .await?;
 
+        // Bloom filter phase reads are served from a parallel prefetch (apache/iceberg-rust#3191).
+        let (parquet_file_reader, bloom_filter_prefetcher) =
+            super::bloom_filter_prefetch::BloomFilterPrefetcher::attach_to_reader(
+                parquet_file_reader,
+                self.bloom_filter_enabled,
+                &task.data_file_path,
+                self.scan_metrics.bloom_filter(),
+            );
+
         // Check if Parquet file has embedded field IDs
         // Corresponds to Java's ParquetSchemaUtil.hasIds()
         // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
@@ -448,6 +457,16 @@ impl FileScanTaskReader {
                     }
                 };
 
+                // Keeps the prefetched SBBF bytes until the filter below has read them.
+                let _bloom_filter_prefetch_guard = bloom_filter_prefetcher
+                    .prefetch(
+                        &predicate,
+                        record_batch_stream_builder.metadata(),
+                        candidate_rgs,
+                        &field_id_map,
+                    )
+                    .await;
+
                 let bloom_filtered = Self::filter_row_groups_by_bloom_filter(
                     &predicate,
                     &mut record_batch_stream_builder,
@@ -455,6 +474,10 @@ impl FileScanTaskReader {
                     &field_id_map,
                 )
                 .await?;
+
+                self.scan_metrics
+                    .bloom_filter()
+                    .record_row_groups(candidate_rgs.len(), bloom_filtered.len());
 
                 if bloom_filtered.len() < candidate_rgs.len() {
                     selected_row_group_indices = Some(bloom_filtered);
