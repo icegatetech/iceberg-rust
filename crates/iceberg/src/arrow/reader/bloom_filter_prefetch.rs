@@ -49,8 +49,8 @@ use parquet::file::metadata::ParquetMetaData;
 
 use super::{ArrowFileReader, ParquetReadOptions};
 use crate::arrow::scan_metrics::BloomFilterMetrics;
-use crate::expr::visitors::bloom_filter_evaluator::collect_bloom_filter_field_ids;
 use crate::expr::BoundPredicate;
+use crate::expr::visitors::bloom_filter_evaluator::collect_bloom_filter_field_ids;
 use crate::io::{FileMetadata, FileRead};
 use crate::{Error, ErrorKind, Result};
 
