@@ -52,6 +52,12 @@ impl ArrowFileReader {
         self.parquet_read_options = options;
         self
     }
+
+    /// Splits the reader into the parts it was built from, so the caller can wrap
+    /// the underlying [`FileRead`] and build a new reader around it.
+    pub(crate) fn into_parts(self) -> (FileMetadata, ParquetReadOptions, Box<dyn FileRead>) {
+        (self.meta, self.parquet_read_options, self.r)
+    }
 }
 
 impl AsyncFileReader for ArrowFileReader {

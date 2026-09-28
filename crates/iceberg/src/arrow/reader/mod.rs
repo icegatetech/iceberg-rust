@@ -34,6 +34,7 @@ const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 /// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
 const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
 
+mod bloom_filter_prefetch;
 mod file_reader;
 mod options;
 mod pipeline;
@@ -53,6 +54,7 @@ pub struct ArrowReaderBuilder {
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
 }
@@ -68,6 +70,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
         }
@@ -95,6 +98,22 @@ impl ArrowReaderBuilder {
     /// Determines whether to enable row selection.
     pub fn with_row_selection_enabled(mut self, row_selection_enabled: bool) -> Self {
         self.row_selection_enabled = row_selection_enabled;
+        self
+    }
+
+    /// Determines whether to enable bloom filter-based row group filtering.
+    ///
+    /// When enabled, if a read is performed with an equality or IN predicate,
+    /// the bloom filter for relevant columns in each row group is read and
+    /// checked. Row groups where the bloom filter proves the value is absent
+    /// are skipped entirely.
+    ///
+    /// Defaults to disabled. The bloom filters of the candidate row groups are
+    /// prefetched in parallel before any data is read: only byte-adjacent bloom
+    /// filters are merged into one request, and up to `range_fetch_concurrency`
+    /// requests run at the same time.
+    pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
+        self.bloom_filter_enabled = bloom_filter_enabled;
         self
     }
 
@@ -137,6 +156,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
         }
     }
@@ -154,5 +174,6 @@ pub struct ArrowReader {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
 }
