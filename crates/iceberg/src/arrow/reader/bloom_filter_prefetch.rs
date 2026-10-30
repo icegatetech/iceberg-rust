@@ -1114,6 +1114,8 @@ mod tests {
         let predicate = a_equals(41);
         let (expected_rows, _) = fixture.read(&predicate, false).await;
         let last_row_group = ROW_GROUPS as usize - 1;
+        // A single coalesced read is expected, not the bytes of the range.
+        #[allow(clippy::single_range_in_vec_init)]
         let cases = [
             ConfiguredGapCase {
                 name: "every gap is at most the threshold",
