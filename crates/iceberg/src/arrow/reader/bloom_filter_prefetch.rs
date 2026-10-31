@@ -31,8 +31,11 @@
 //!   `filter_row_groups_by_bloom_filter` treats as a missing filter, so that column
 //!   cannot prune its row group. Such SBBFs are counted in [`BloomFilterMetrics::read_errors`] and
 //!   reported with one `tracing::warn!` per data file.
-//! - Only byte-adjacent SBBFs are merged into one request, so no row group data
-//!   is fetched along with them.
+//! - SBBFs are merged into one request with the reader's `range_coalesce_bytes` gap
+//!   only when all of them lie after the column data of the file; otherwise only
+//!   byte-adjacent SBBFs are merged. Either way no row group data is fetched along
+//!   with them, but a merged request also fetches the SBBFs of other columns that
+//!   lie between the requested ones.
 //!
 //! Limitation: a column chunk without `bloom_filter_length` is not prefetched.
 //! `filter_row_groups_by_bloom_filter` reads it serially, and its read errors are
@@ -133,8 +136,16 @@ impl BloomFilterPrefetcher {
             return BloomFilterPrefetchGuard { cache: None };
         }
 
+        let range_coalesce_bytes = choose_sbbf_coalesce_bytes(
+            &sbbf_ranges,
+            compute_data_end_offset(metadata),
+            enabled.fetcher.parquet_read_options.range_coalesce_bytes(),
+        );
         // TODO(med): keeps the SBBFs of every candidate row group of a data file in memory at once, for up to concurrency_limit_data_files files; bound it by fetching in windows
-        let fetched = enabled.fetcher.fetch(&sbbf_ranges).await;
+        let fetched = enabled
+            .fetcher
+            .fetch(&sbbf_ranges, range_coalesce_bytes)
+            .await;
         enabled.report_unreadable(&fetched);
         enabled.cache.insert_all(fetched.entries);
 
@@ -217,9 +228,16 @@ struct SbbfFetcher {
 }
 
 impl SbbfFetcher {
-    /// Fetches `sbbf_ranges`, merging only byte-adjacent ranges, and checks that
-    /// every range holds a complete SBBF.
-    async fn fetch(&self, sbbf_ranges: &[Range<u64>]) -> FetchedBloomFilters {
+    /// Fetches `sbbf_ranges`, merging ranges whose gap is at most
+    /// `range_coalesce_bytes`, and checks that every range holds a complete SBBF.
+    ///
+    /// The caller chooses `range_coalesce_bytes`: whatever lies in a merged gap is
+    /// fetched too.
+    async fn fetch(
+        &self,
+        sbbf_ranges: &[Range<u64>],
+        range_coalesce_bytes: u64,
+    ) -> FetchedBloomFilters {
         let mut reader = ArrowFileReader::new(
             FileMetadata {
                 size: self.file_size,
@@ -227,7 +245,7 @@ impl SbbfFetcher {
             Box::new(Arc::clone(&self.file_read)),
         )
         .with_parquet_read_options(ParquetReadOptions {
-            range_coalesce_bytes: 0,
+            range_coalesce_bytes,
             ..self.parquet_read_options
         });
 
@@ -261,6 +279,55 @@ impl SbbfFetcher {
                 first_error: Some(err.to_string()),
             },
         }
+    }
+}
+
+/// Offset of the first byte after the last column chunk of `metadata`.
+///
+/// Row data lives only in column chunks, and every column chunk is listed in the footer,
+/// so the bytes from this offset to the end of the file hold no row data: only SBBFs,
+/// the page index and the footer. Row groups are not assumed to be in file order.
+///
+/// Returns `None` when an offset or a length is negative.
+fn compute_data_end_offset(metadata: &ParquetMetaData) -> Option<u64> {
+    // `ColumnChunkMetaData::byte_range` locates the chunk the same way, but it
+    // asserts that the offset and the length are not negative. The sum of two
+    // non-negative `i64` values always fits in `u64`; `checked_add` keeps that
+    // guarantee local instead of relying on it.
+    metadata
+        .row_groups()
+        .iter()
+        .flat_map(|row_group| row_group.columns())
+        .try_fold(0u64, |max_end, column| {
+            let start = column
+                .dictionary_page_offset()
+                .unwrap_or(column.data_page_offset());
+            let start = u64::try_from(start).ok()?;
+            let length = u64::try_from(column.compressed_size()).ok()?;
+            let end = start.checked_add(length)?;
+            Some(max_end.max(end))
+        })
+}
+
+/// Gap threshold for merging the SBBF reads of one data file.
+///
+/// Returns `configured_coalesce_bytes` only when every range starts at or after
+/// `data_end_offset`: the gaps between such ranges hold other SBBFs, never row data.
+/// Otherwise returns 0, so only byte-adjacent SBBFs are merged.
+fn choose_sbbf_coalesce_bytes(
+    sbbf_ranges: &[Range<u64>],
+    data_end_offset: Option<u64>,
+    configured_coalesce_bytes: u64,
+) -> u64 {
+    match data_end_offset {
+        Some(data_end_offset)
+            if sbbf_ranges
+                .iter()
+                .all(|range| range.start >= data_end_offset) =>
+        {
+            configured_coalesce_bytes
+        }
+        _ => 0,
     }
 }
 
@@ -369,15 +436,19 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
-    use parquet::file::metadata::ParquetMetaDataReader;
-    use parquet::file::properties::WriterProperties;
-    use parquet::schema::types::ColumnPath;
+    use parquet::file::metadata::{
+        ColumnChunkMetaData, FileMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    };
+    use parquet::file::properties::{BloomFilterPosition, WriterProperties};
+    use parquet::schema::parser::parse_message_type;
+    use parquet::schema::types::{ColumnPath, SchemaDescriptor};
     use serde::{Deserialize, Serialize};
     use tokio::sync::{Barrier, Notify};
     use tokio::time::timeout;
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Level, Metadata, Subscriber};
 
+    use super::{choose_sbbf_coalesce_bytes, compute_data_end_offset};
     use crate::arrow::{ArrowReaderBuilder, BloomFilterMetrics};
     use crate::expr::{Bind, Predicate, Reference};
     use crate::io::{
@@ -634,6 +705,9 @@ mod tests {
         file_size: u64,
         /// Computed from the footer, independently of the prefetch code.
         sbbf_ranges: Vec<RowGroupSbbfRanges>,
+        /// End of the last column chunk of the file, computed from the footer
+        /// independently of the prefetch code.
+        column_data_end: u64,
     }
 
     fn field_with_id(name: &str, id: i32) -> Field {
@@ -644,7 +718,15 @@ mod tests {
     }
 
     impl Fixture {
+        /// A file whose SBBFs follow the data of their row group.
         async fn new(layout: Layout) -> Self {
+            Self::with_bloom_filter_position(layout, BloomFilterPosition::AfterRowGroup).await
+        }
+
+        async fn with_bloom_filter_position(
+            layout: Layout,
+            bloom_filter_position: BloomFilterPosition,
+        ) -> Self {
             let storage = BloomFilterProbeStorage::default();
             let probe = Arc::clone(&storage.probe);
             let file_io =
@@ -667,7 +749,9 @@ mod tests {
                 field_with_id("c", 3),
             ]));
 
-            let mut props = WriterProperties::builder().set_compression(Compression::UNCOMPRESSED);
+            let mut props = WriterProperties::builder()
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_bloom_filter_position(bloom_filter_position);
             for column in ["a", "b"] {
                 props = props
                     .set_column_bloom_filter_ndv(ColumnPath::from(column), ROWS_PER_GROUP as u64)
@@ -719,6 +803,16 @@ mod tests {
                     }
                 })
                 .collect();
+            let column_data_end = metadata
+                .row_groups()
+                .iter()
+                .flat_map(|row_group| row_group.columns())
+                .map(|chunk| {
+                    let (start, length) = chunk.byte_range();
+                    start + length
+                })
+                .max()
+                .unwrap();
 
             let file_size = bytes.len() as u64;
             probe.file_size.store(file_size, Ordering::SeqCst);
@@ -739,6 +833,7 @@ mod tests {
                 schema,
                 file_size,
                 sbbf_ranges,
+                column_data_end,
             }
         }
 
@@ -803,6 +898,27 @@ mod tests {
             let (on, metrics) = self.read(predicate, true).await;
             assert_eq!(on, off, "bloom filter pruning changed the rows returned");
             metrics
+        }
+
+        /// Reads the file with bloom filter pruning on and the given
+        /// `range_coalesce_bytes`, like [`Self::read`].
+        async fn read_with_range_coalesce_bytes(
+            &self,
+            predicate: &Predicate,
+            range_coalesce_bytes: u64,
+        ) -> (Option<RecordBatch>, BloomFilterMetrics) {
+            let result = ArrowReaderBuilder::new(self.file_io.clone(), Runtime::current())
+                .with_bloom_filter_enabled(true)
+                .with_range_coalesce_bytes(range_coalesce_bytes)
+                .build()
+                .read(self.tasks(predicate))
+                .unwrap();
+            let metrics = result.metrics().bloom_filter().clone();
+            let batches: Vec<RecordBatch> = timeout(TIMEOUT, result.stream().try_collect())
+                .await
+                .expect("scan timed out")
+                .unwrap();
+            (collapse(&batches), metrics)
         }
     }
 
@@ -936,6 +1052,274 @@ mod tests {
             .map(|ranges| (ranges.a.end - ranges.a.start) + (ranges.b.end - ranges.b.start))
             .sum();
         assert_eq!(read_bytes, sbbf_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_prefetch_merges_sbbfs_after_data_into_one_read() {
+        let fixture =
+            Fixture::with_bloom_filter_position(Layout::Interleaved, BloomFilterPosition::End)
+                .await;
+        assert!(
+            fixture.sbbf_ranges.iter().all(|ranges| {
+                ranges.a.start >= fixture.column_data_end
+                    && ranges.b.start >= fixture.column_data_end
+            }),
+            "every SBBF must lie after the column data"
+        );
+
+        // Only `a` is probed, so the SBBFs of `b` lie in the gaps between the reads.
+        let metrics = fixture.read_and_compare(&a_equals(41)).await;
+
+        let last_row_group = ROW_GROUPS as usize - 1;
+        assert_eq!(fixture.probe.take_sbbf_reads(), vec![
+            fixture.sbbf_ranges[0].a.start..fixture.sbbf_ranges[last_row_group].a.end
+        ]);
+        assert_eq!(metrics.row_groups_pruned(), 2);
+        assert_eq!(metrics.row_groups_matched(), 1);
+    }
+
+    struct ConfiguredGapCase {
+        name: &'static str,
+        range_coalesce_bytes: u64,
+        expected_sbbf_reads: Vec<Range<u64>>,
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_prefetch_coalesces_sbbfs_after_data_within_configured_gap() {
+        let fixture =
+            Fixture::with_bloom_filter_position(Layout::Interleaved, BloomFilterPosition::End)
+                .await;
+        assert!(
+            fixture.sbbf_ranges.iter().all(|ranges| {
+                ranges.a.start >= fixture.column_data_end
+                    && ranges.b.start >= fixture.column_data_end
+            }),
+            "every SBBF must lie after the column data"
+        );
+        // Only `a` is probed; the gaps between its SBBFs hold the SBBFs of `b`, so
+        // byte-adjacent merging alone cannot join them.
+        let a_ranges: Vec<Range<u64>> = fixture
+            .sbbf_ranges
+            .iter()
+            .map(|ranges| ranges.a.clone())
+            .collect();
+        let gaps: Vec<u64> = a_ranges
+            .windows(2)
+            .map(|pair| pair[1].start - pair[0].end)
+            .collect();
+        let min_gap = *gaps.iter().min().unwrap();
+        let max_gap = *gaps.iter().max().unwrap();
+        assert!(min_gap > 0, "the SBBFs of `b` must separate those of `a`");
+
+        let predicate = a_equals(41);
+        let (expected_rows, _) = fixture.read(&predicate, false).await;
+        let last_row_group = ROW_GROUPS as usize - 1;
+        // A single coalesced read is expected, not the bytes of the range.
+        #[allow(clippy::single_range_in_vec_init)]
+        let cases = [
+            ConfiguredGapCase {
+                name: "every gap is at most the threshold",
+                range_coalesce_bytes: max_gap,
+                expected_sbbf_reads: vec![a_ranges[0].start..a_ranges[last_row_group].end],
+            },
+            ConfiguredGapCase {
+                name: "every gap is a byte over the threshold",
+                range_coalesce_bytes: min_gap - 1,
+                expected_sbbf_reads: a_ranges.clone(),
+            },
+        ];
+
+        for case in cases {
+            fixture.probe.take_reads();
+
+            let (rows, metrics) = fixture
+                .read_with_range_coalesce_bytes(&predicate, case.range_coalesce_bytes)
+                .await;
+
+            assert_eq!(
+                fixture.probe.take_sbbf_reads(),
+                case.expected_sbbf_reads,
+                "{}",
+                case.name
+            );
+            assert_eq!(rows, expected_rows, "{}", case.name);
+            assert_eq!(
+                (
+                    metrics.row_groups_pruned(),
+                    metrics.row_groups_matched(),
+                    metrics.read_errors()
+                ),
+                (2, 1, 0),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// Placement of one column chunk in a file.
+    #[derive(Clone, Copy)]
+    struct ChunkPlacement {
+        dictionary_page_offset: Option<i64>,
+        data_page_offset: i64,
+        compressed_size: i64,
+    }
+
+    /// A chunk without a dictionary page.
+    fn chunk(data_page_offset: i64, compressed_size: i64) -> ChunkPlacement {
+        ChunkPlacement {
+            dictionary_page_offset: None,
+            data_page_offset,
+            compressed_size,
+        }
+    }
+
+    /// Footer metadata whose row groups hold the given column chunks. Every row
+    /// group has as many INT32 columns as the first one.
+    fn metadata_with_chunks(row_groups: &[&[ChunkPlacement]]) -> ParquetMetaData {
+        let columns: String = (0..row_groups[0].len())
+            .map(|column| format!("required int32 c{column};"))
+            .collect();
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            parse_message_type(&format!("message m {{ {columns} }}")).unwrap(),
+        )));
+        let row_groups = row_groups
+            .iter()
+            .map(|chunks| {
+                let columns = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(column, placement)| {
+                        ColumnChunkMetaData::builder(schema.column(column))
+                            .set_dictionary_page_offset(placement.dictionary_page_offset)
+                            .set_data_page_offset(placement.data_page_offset)
+                            .set_total_compressed_size(placement.compressed_size)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+                RowGroupMetaData::builder(Arc::clone(&schema))
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        ParquetMetaData::new(
+            FileMetaData::new(1, 0, None, None, schema, None),
+            row_groups,
+        )
+    }
+
+    struct DataEndCase<'a> {
+        name: &'static str,
+        row_groups: &'a [&'a [ChunkPlacement]],
+        expected: Option<u64>,
+    }
+
+    #[test]
+    fn test_compute_data_end_offset() {
+        let cases = [
+            DataEndCase {
+                name: "chunk starts at its dictionary page",
+                row_groups: &[&[ChunkPlacement {
+                    dictionary_page_offset: Some(100),
+                    data_page_offset: 150,
+                    compressed_size: 80,
+                }]],
+                expected: Some(180),
+            },
+            DataEndCase {
+                name: "chunk starts at its data page",
+                row_groups: &[&[chunk(150, 80)]],
+                expected: Some(230),
+            },
+            DataEndCase {
+                name: "row groups are not in file order",
+                row_groups: &[&[chunk(800, 100)], &[chunk(300, 100)]],
+                expected: Some(900),
+            },
+            DataEndCase {
+                name: "last column of a row group is not the last in the file",
+                row_groups: &[&[chunk(600, 100), chunk(400, 100)]],
+                expected: Some(700),
+            },
+            DataEndCase {
+                name: "negative offset",
+                row_groups: &[&[chunk(-1, 80)]],
+                expected: None,
+            },
+            DataEndCase {
+                name: "negative length",
+                row_groups: &[&[chunk(150, -1)]],
+                expected: None,
+            },
+            DataEndCase {
+                name: "largest offset and length do not overflow",
+                row_groups: &[&[chunk(i64::MAX, i64::MAX)]],
+                expected: Some(18_446_744_073_709_551_614),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                compute_data_end_offset(&metadata_with_chunks(case.row_groups)),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    struct CoalesceCase {
+        name: &'static str,
+        data_end_offset: Option<u64>,
+        /// `(start, end)` of each SBBF range.
+        sbbf_ranges: &'static [(u64, u64)],
+        expected: u64,
+    }
+
+    #[test]
+    fn test_choose_sbbf_coalesce_bytes() {
+        const CONFIGURED: u64 = 1024;
+        let cases = [
+            CoalesceCase {
+                name: "every SBBF after the data",
+                data_end_offset: Some(100),
+                sbbf_ranges: &[(100, 110), (150, 160)],
+                expected: CONFIGURED,
+            },
+            CoalesceCase {
+                name: "SBBF exactly at the data end",
+                data_end_offset: Some(100),
+                sbbf_ranges: &[(100, 110)],
+                expected: CONFIGURED,
+            },
+            CoalesceCase {
+                name: "one SBBF a byte before the data end",
+                data_end_offset: Some(100),
+                sbbf_ranges: &[(99, 110), (150, 160)],
+                expected: 0,
+            },
+            CoalesceCase {
+                name: "data end unknown",
+                data_end_offset: None,
+                sbbf_ranges: &[(150, 160)],
+                expected: 0,
+            },
+        ];
+
+        for case in cases {
+            let sbbf_ranges: Vec<Range<u64>> = case
+                .sbbf_ranges
+                .iter()
+                .map(|&(start, end)| start..end)
+                .collect();
+            assert_eq!(
+                choose_sbbf_coalesce_bytes(&sbbf_ranges, case.data_end_offset, CONFIGURED),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
