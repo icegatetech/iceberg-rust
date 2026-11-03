@@ -1054,4 +1054,41 @@ mod tests {
 
         assert_eq!(summary_property(&table, INHERITED_KEY), None);
     }
+
+    /// A transaction built against a snapshot that another writer has since superseded commits
+    /// against the fresh base, and inherits the value of the snapshot it actually lands on.
+    #[tokio::test]
+    async fn test_fast_append_inherits_summary_property_from_the_base_it_commits_on() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let stale = commit_append(
+            &catalog,
+            &table,
+            HashMap::from([(INHERITED_KEY.to_string(), "42".to_string())]),
+            "a.parquet",
+        )
+        .await;
+
+        let tx = Transaction::new(&stale);
+        let tx = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([("stamp".to_string(), "x".to_string())]))
+            .inherit_summary_property(INHERITED_KEY)
+            .apply(tx)
+            .unwrap();
+        commit_append(
+            &catalog,
+            &stale,
+            HashMap::from([(INHERITED_KEY.to_string(), "43".to_string())]),
+            "b.parquet",
+        )
+        .await;
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(table.metadata().snapshots().count(), 3);
+        assert_eq!(
+            summary_property(&table, INHERITED_KEY),
+            Some("43".to_string())
+        );
+    }
 }
