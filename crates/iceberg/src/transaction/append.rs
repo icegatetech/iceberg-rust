@@ -35,6 +35,7 @@ pub struct FastAppendAction {
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
+    inherit_summary_keys: Vec<String>,
     added_data_files: Vec<DataFile>,
 }
 
@@ -44,6 +45,7 @@ impl FastAppendAction {
             check_duplicate: true,
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
+            inherit_summary_keys: vec![],
             added_data_files: vec![],
         }
     }
@@ -72,6 +74,18 @@ impl FastAppendAction {
         self
     }
 
+    /// Carry `key` from the snapshot this append supersedes (the current snapshot of
+    /// the base the commit is produced against) onto the new snapshot, unchanged.
+    ///
+    /// The value is resolved at snapshot-production time, so under the
+    /// optimistic-concurrency retry it reflects the fresh base. An explicit
+    /// [`Self::set_snapshot_properties`] entry for the same key takes precedence.
+    /// A key absent from that snapshot, or a table with no snapshot yet, adds nothing.
+    pub fn inherit_summary_property(mut self, key: impl Into<String>) -> Self {
+        self.inherit_summary_keys.push(key.into());
+        self
+    }
+
     /// Collapse files sharing a path to their first occurrence, so a single
     /// manifest never references the same file twice. Always runs (unlike the
     /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
@@ -93,7 +107,8 @@ impl TransactionAction for FastAppendAction {
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.snapshot_properties.clone(),
             self.dedupe_added_files(),
-        );
+        )
+        .with_inherit_summary_keys(self.inherit_summary_keys.clone());
 
         // validate added files
         snapshot_producer.validate_added_data_files()?;
@@ -164,6 +179,7 @@ mod tests {
     use crate::encryption::kms::MemoryKeyManagementClient;
     use crate::encryption::{SensitiveBytes, StandardKeyMetadata};
     use crate::io::FileIO;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, SnapshotRef,
@@ -171,9 +187,9 @@ mod tests {
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
-    use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
-    use crate::{TableIdent, TableRequirement, TableUpdate};
+    use crate::transaction::tests::{make_v2_minimal_table, make_v3_minimal_table_in_catalog};
+    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
+    use crate::{Catalog, TableIdent, TableRequirement, TableUpdate};
 
     fn render_template(template: &str, ctx: Value) -> String {
         let mut env = Environment::new();
@@ -920,5 +936,159 @@ mod tests {
             manifest.entries()[0].snapshot_id().unwrap()
         );
         assert_eq!(data_file, *manifest.entries()[0].data_file());
+    }
+
+    /// Summary key the inheritance tests carry from the parent snapshot.
+    const INHERITED_KEY: &str = "wal.offset";
+
+    fn inheritance_data_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Commit an append carrying `properties` and return the table it produced.
+    async fn commit_append(
+        catalog: &impl Catalog,
+        table: &Table,
+        properties: HashMap<String, String>,
+        path: &str,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        tx.fast_append()
+            .set_snapshot_properties(properties)
+            .add_data_files(vec![inheritance_data_file(path)])
+            .apply(tx)
+            .unwrap()
+            .commit(catalog)
+            .await
+            .unwrap()
+    }
+
+    fn summary_property(table: &Table, key: &str) -> Option<String> {
+        table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties
+            .get(key)
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_inherits_summary_property_from_parent_snapshot() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let parent_properties = HashMap::from([(INHERITED_KEY.to_string(), "42".to_string())]);
+        let table = commit_append(&catalog, &table, parent_properties, "a.parquet").await;
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([("stamp".to_string(), "x".to_string())]))
+            .inherit_summary_property(INHERITED_KEY)
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary_property(&table, INHERITED_KEY),
+            Some("42".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_explicit_property_overrides_inherited_one() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let parent_properties = HashMap::from([(INHERITED_KEY.to_string(), "42".to_string())]);
+        let table = commit_append(&catalog, &table, parent_properties, "a.parquet").await;
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([(
+                INHERITED_KEY.to_string(),
+                "7".to_string(),
+            )]))
+            .inherit_summary_property(INHERITED_KEY)
+            .add_data_files(vec![inheritance_data_file("b.parquet")])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary_property(&table, INHERITED_KEY),
+            Some("7".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_on_table_without_snapshot_inherits_nothing() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        assert!(table.metadata().current_snapshot().is_none());
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .inherit_summary_property(INHERITED_KEY)
+            .add_data_files(vec![inheritance_data_file("a.parquet")])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(summary_property(&table, INHERITED_KEY), None);
+    }
+
+    /// A transaction built against a snapshot that another writer has since superseded commits
+    /// against the fresh base, and inherits the value of the snapshot it actually lands on.
+    #[tokio::test]
+    async fn test_fast_append_inherits_summary_property_from_the_base_it_commits_on() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let stale = commit_append(
+            &catalog,
+            &table,
+            HashMap::from([(INHERITED_KEY.to_string(), "42".to_string())]),
+            "a.parquet",
+        )
+        .await;
+
+        let tx = Transaction::new(&stale);
+        let tx = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([("stamp".to_string(), "x".to_string())]))
+            .inherit_summary_property(INHERITED_KEY)
+            .apply(tx)
+            .unwrap();
+        commit_append(
+            &catalog,
+            &stale,
+            HashMap::from([(INHERITED_KEY.to_string(), "43".to_string())]),
+            "b.parquet",
+        )
+        .await;
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(table.metadata().snapshots().count(), 3);
+        assert_eq!(
+            summary_property(&table, INHERITED_KEY),
+            Some("43".to_string())
+        );
     }
 }
